@@ -10,6 +10,7 @@ RUN npm ci --no-audit --no-fund
 COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
 RUN npm run build
+COPY migrations ./migrations
 
 EXPOSE 3000
 CMD ["node", "dist/main.js"]

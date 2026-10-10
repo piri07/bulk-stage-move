@@ -24,13 +24,20 @@ services:
       timeout: 3s
       retries: 30
 
+  migrate:
+    <<: *app
+    command: ['node', 'dist/db/migrate.js']
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     <<: *app
     ports:
       - '${API_PORT:-3000}:3000'
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:

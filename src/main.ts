@@ -2,14 +2,14 @@ import 'reflect-metadata';
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
-import { loadConfig } from './config';
+import { APP_CONFIG, type AppConfig } from './config';
 
 async function bootstrap(): Promise<void> {
-  const config = loadConfig();
   const app = await NestFactory.create(AppModule);
   app.enableShutdownHooks();
-  await app.listen(config.port);
-  Logger.log(`API listening on :${config.port}`, 'Bootstrap');
+  const { port } = app.get<AppConfig>(APP_CONFIG);
+  await app.listen(port);
+  Logger.log(`API listening on :${port}`, 'Bootstrap');
 }
 
 void bootstrap();
