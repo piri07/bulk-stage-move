@@ -1,4 +1,7 @@
-.PHONY: up down db migrate seed seed-full test psql logs
+.PHONY: help up down db migrate seed seed-full test psql logs
+
+help: ## List the targets
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
 
 up: ## Build and start the whole stack
 	docker compose up --build
