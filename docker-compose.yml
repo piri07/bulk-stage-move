@@ -1,0 +1,36 @@
+name: bulk-stage-move
+
+x-app: &app
+  build: .
+  image: bulk-stage-move:local
+  environment:
+    DATABASE_URL: postgres://crm:crm@postgres:5432/crm
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: crm
+      POSTGRES_PASSWORD: crm
+      POSTGRES_DB: crm
+    ports:
+      # 5433 on the host so a locally installed Postgres on 5432 doesn't collide.
+      - '${PG_PORT:-5433}:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U crm -d crm']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    <<: *app
+    ports:
+      - '${API_PORT:-3000}:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
