@@ -71,6 +71,12 @@ The details:
 - Deals entering or leaving the stage between requests don't shift later pages, as they would with
   `OFFSET`.
 - The extra row tells us whether another page exists, without a `COUNT`.
+- A deal's history (`GET /opportunities/:id/transitions`) uses the same contract on
+  `stage_transitions(opportunity_id, id)`. It is ordered by `id` rather than by time because id
+  order is the order the row lock granted the moves. A deal outside the caller's workspace returns
+  404, not an empty history.
+- There is deliberately no workspace-wide history feed. It would need another index on a table
+  the bulk job writes 50,000 rows to per run.
 
 ### Indexes, and why there are so few
 

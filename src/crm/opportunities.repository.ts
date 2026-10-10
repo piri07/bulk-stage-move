@@ -87,12 +87,22 @@ export async function updateOpportunityStage(
   return oneRow(rows);
 }
 
+export type TransitionSource = 'manual';
+
 export interface NewStageTransition {
   workspaceId: string;
   opportunityId: number;
   fromStage: Stage;
   toStage: Stage;
-  source: 'manual';
+  source: TransitionSource;
+}
+
+export interface StageTransition {
+  id: number;
+  fromStage: Stage;
+  toStage: Stage;
+  source: TransitionSource;
+  createdAt: Date;
 }
 
 export async function insertStageTransition(
@@ -110,6 +120,28 @@ export async function insertStageTransition(
       transition.source,
     ],
   );
+}
+
+/**
+ * One page of a deal's history, oldest first. Id order is the order the row lock granted the
+ * moves, so it is the true sequence; served by the (opportunity_id, id) index.
+ */
+export async function listStageTransitions(
+  db: Queryable,
+  workspaceId: string,
+  opportunityId: number,
+  afterId: number,
+  limit: number,
+): Promise<StageTransition[]> {
+  const { rows } = await db.query<StageTransition>(
+    `SELECT id, from_stage AS "fromStage", to_stage AS "toStage", source, created_at AS "createdAt"
+       FROM stage_transitions
+      WHERE opportunity_id = $1 AND workspace_id = $2 AND id > $3
+      ORDER BY id
+      LIMIT $4`,
+    [opportunityId, workspaceId, afterId, limit],
+  );
+  return rows;
 }
 
 /**

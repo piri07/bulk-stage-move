@@ -46,6 +46,10 @@ describe('opportunities API', () => {
     return api().patch(`/opportunities/${id}/stage`).set(WS, workspaceId).send(body);
   }
 
+  function history(workspaceId: string, id: number, query: object = {}) {
+    return api().get(`/opportunities/${id}/transitions`).set(WS, workspaceId).query(query);
+  }
+
   async function transitionsOf(id: number): Promise<{ from_stage: Stage; to_stage: Stage }[]> {
     const { rows } = await pool.query<{ from_stage: Stage; to_stage: Stage }>(
       'SELECT from_stage, to_stage FROM stage_transitions WHERE opportunity_id = $1 ORDER BY id',
@@ -65,6 +69,7 @@ describe('opportunities API', () => {
       const deal = await createDeal(mine, { stage: 'qualified' });
 
       await api().get(`/opportunities/${deal.id}`).set(WS, theirs).expect(404);
+      await history(theirs, deal.id).expect(404);
       await move(theirs, deal.id, { stage: 'contacted' }).expect(404);
       const list = await api()
         .get('/opportunities')
@@ -201,6 +206,44 @@ describe('opportunities API', () => {
         stage: chain.at(-1)?.to_stage,
         version: targets.length + 1,
       });
+    });
+  });
+
+  describe('stage history', () => {
+    it("lists a deal's transitions oldest first, a page at a time", async () => {
+      const deal = await createDeal(workspace);
+      for (const stage of ['contacted', 'qualified', 'negotiation']) {
+        await move(workspace, deal.id, { stage }).expect(200);
+      }
+
+      const first = await history(workspace, deal.id, { limit: 2 }).expect(200);
+      expect(first.body.items).toMatchObject([
+        { fromStage: 'new_lead', toStage: 'contacted', source: 'manual' },
+        { fromStage: 'contacted', toStage: 'qualified', source: 'manual' },
+      ]);
+      expect(first.body.nextCursor).toBe(first.body.items[1].id);
+
+      const second = await history(workspace, deal.id, {
+        limit: 2,
+        cursor: first.body.nextCursor,
+      }).expect(200);
+      expect(second.body).toMatchObject({
+        items: [{ fromStage: 'qualified', toStage: 'negotiation' }],
+        nextCursor: null,
+      });
+    });
+
+    it('is empty for a deal that never moved', async () => {
+      const deal = await createDeal(workspace);
+      const res = await history(workspace, deal.id).expect(200);
+      expect(res.body).toEqual({ items: [], nextCursor: null });
+    });
+
+    it('rejects invalid paging with 400 and an unknown deal with 404', async () => {
+      const deal = await createDeal(workspace);
+      await history(workspace, deal.id, { limit: 0 }).expect(400);
+      await history(workspace, deal.id, { stage: 'qualified' }).expect(400);
+      await history(workspace, 999_999_999).expect(404);
     });
   });
 

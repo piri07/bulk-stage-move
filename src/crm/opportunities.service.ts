@@ -1,5 +1,6 @@
 import { ConflictException, Inject, Injectable, NotFoundException } from '@nestjs/common';
 import { Pool } from 'pg';
+import { toPage, type Page, type PageQuery } from '../common/pagination';
 import { PG_POOL } from '../db/database.module';
 import { isPgError, PgErrorCode } from '../db/pg-errors';
 import { withTransaction } from '../db/transaction';
@@ -10,16 +11,12 @@ import {
   insertOpportunity,
   insertStageTransition,
   listOpportunitiesInStage,
+  listStageTransitions,
   updateOpportunityStage,
   type Opportunity,
+  type StageTransition,
 } from './opportunities.repository';
 import { INITIAL_STAGE } from './pipeline';
-
-export interface OpportunityPage {
-  items: Opportunity[];
-  /** Pass back as `cursor` for the next page; null on the last page. */
-  nextCursor: number | null;
-}
 
 @Injectable()
 export class OpportunitiesService {
@@ -80,8 +77,10 @@ export class OpportunitiesService {
     });
   }
 
-  async listInStage(workspaceId: string, query: ListOpportunitiesQuery): Promise<OpportunityPage> {
-    // One extra row tells us whether another page exists, without a COUNT.
+  async listInStage(
+    workspaceId: string,
+    query: ListOpportunitiesQuery,
+  ): Promise<Page<Opportunity>> {
     const rows = await listOpportunitiesInStage(
       this.pool,
       workspaceId,
@@ -89,8 +88,23 @@ export class OpportunitiesService {
       query.cursor ?? 0,
       query.limit + 1,
     );
-    const items = rows.slice(0, query.limit);
-    const hasMore = rows.length > query.limit;
-    return { items, nextCursor: hasMore ? (items.at(-1)?.id ?? null) : null };
+    return toPage(rows, query.limit);
+  }
+
+  async listTransitions(
+    workspaceId: string,
+    id: number,
+    query: PageQuery,
+  ): Promise<Page<StageTransition>> {
+    // A deal outside this workspace is a 404, not an empty (and misleading) history.
+    await this.get(workspaceId, id);
+    const rows = await listStageTransitions(
+      this.pool,
+      workspaceId,
+      id,
+      query.cursor ?? 0,
+      query.limit + 1,
+    );
+    return toPage(rows, query.limit);
   }
 }

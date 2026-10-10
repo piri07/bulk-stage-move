@@ -58,6 +58,7 @@ is concentrated where behaviour is subtle:
 - keyset paging
 - the stage-move rules: transition plus version bump, same-stage no-op, and 409 on a stale
   `expectedVersion`
+- a deal's stage history, read oldest first and page by page
 - 10 concurrent moves of one deal. They must leave an unbroken transition chain, so this test
   fails if the row lock is removed.
 
@@ -65,14 +66,15 @@ is concentrated where behaviour is subtle:
 
 The `/opportunities` routes require an `X-Workspace-Id` header containing a UUID. There is no auth.
 
-| Method  | Path                                   | Body / notes                                               |
-| ------- | -------------------------------------- | ---------------------------------------------------------- |
-| `GET`   | `/health`                              | liveness and a database ping (503 if unreachable)          |
-| `GET`   | `/stages`                              | the fixed pipeline, in order                               |
-| `POST`  | `/opportunities`                       | `{ name, valueCents, ownerId, stage?, status? }`           |
-| `GET`   | `/opportunities?stage=&limit=&cursor=` | one page of a stage; pass `nextCursor` back as `cursor`    |
-| `GET`   | `/opportunities/:id`                   |                                                            |
-| `PATCH` | `/opportunities/:id/stage`             | `{ stage, expectedVersion? }`; 409 if the version is stale |
+| Method  | Path                                            | Body / notes                                                |
+| ------- | ----------------------------------------------- | ----------------------------------------------------------- |
+| `GET`   | `/health`                                       | liveness and a database ping (503 if unreachable)           |
+| `GET`   | `/stages`                                       | the fixed pipeline, in order                                |
+| `POST`  | `/opportunities`                                | `{ name, valueCents, ownerId, stage?, status? }`            |
+| `GET`   | `/opportunities?stage=&limit=&cursor=`          | one page of a stage; pass `nextCursor` back as `cursor`     |
+| `GET`   | `/opportunities/:id`                            |                                                             |
+| `GET`   | `/opportunities/:id/transitions?limit=&cursor=` | the deal's stage history, oldest first, paged like the list |
+| `PATCH` | `/opportunities/:id/stage`                      | `{ stage, expectedVersion? }`; 409 if the version is stale  |
 
 ```bash
 WS=00000000-0000-4000-8000-000000000002   # Small Co 1
@@ -81,6 +83,8 @@ curl -s "localhost:3000/opportunities?stage=qualified&limit=2" -H "x-workspace-i
 ID=$(curl -s "localhost:3000/opportunities?stage=qualified&limit=1" -H "x-workspace-id: $WS" | jq '.items[0].id')
 curl -s -X PATCH "localhost:3000/opportunities/$ID/stage" -H "x-workspace-id: $WS" \
   -H 'content-type: application/json' -d '{"stage":"proposal_sent"}'
+
+curl -s "localhost:3000/opportunities/$ID/transitions" -H "x-workspace-id: $WS"
 ```
 
 ## Configuration
@@ -101,6 +105,7 @@ Compose publishes Postgres on host port 5433 (`PG_PORT`) and the API on 3000 (`A
 
 - create a deal, get a deal, and list a stage with keyset pagination
 - single stage move with a row lock, optimistic `version`, and a recorded transition
+- each deal's stage history, readable through the API
 - workspace scoping
 - migrations and the deterministic seeder
 - tests
