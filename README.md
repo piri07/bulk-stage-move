@@ -119,6 +119,9 @@ Compose publishes Postgres on host port 5433 (`PG_PORT`) and the API on 3000 (`A
 - per-workspace isolation
 - `BENCHMARKS.md`
 
+**Deliberately not built:** rules on the transition sequence. Any stage can move to any other,
+including backwards and reopening closed deals; see DESIGN.md, assumption 2.
+
 **Out of scope by the brief:** auth, any UI, board views and rollups, custom fields,
 automation events, deployment.
 

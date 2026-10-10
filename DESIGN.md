@@ -13,10 +13,18 @@ CRM foundation that the bulk engine builds on.
    - Per-workspace pipelines would need a `stages(workspace_id, id, position)` table, with a
      composite foreign key `(workspace_id, stage_id)` replacing the enum.
    - The bulk engine only ever writes a stage value, so it would not change.
-2. **Any stage can move to any other.** There are no transition rules.
+2. **No rules on the transition sequence: any stage can move to any other.**
+   - Forward moves, backward moves and skipped stages are all allowed (`new_lead → negotiation`,
+     `proposal_sent → contacted`), and so is reopening a closed deal (`closed_won → new_lead`).
+   - The only special case is moving a deal to the stage it is already in, which is a no-op.
+   - This is deliberate. The brief defines no sequence, and real pipelines are often worked out
+     of order.
    - The bulk engine applies moves in set-based SQL, so every rule would also need a SQL version
      of the TypeScript check. With no rules, there is nothing to keep in sync.
-   - Moving a deal to the stage it is already in is a no-op.
+   - To add rules later, define the allowed `(from, to)` pairs once, for example in an
+     `allowed_transitions` table. The single move would reject a forbidden move with 422. The
+     bulk job would filter on the same table in its `UPDATE … WHERE` and report those deals as
+     skipped.
 3. **Stage and status are independent.** Moving a deal to `closed_won` does not set
    `status = won`. That would be downstream automation, which the brief rules out. The seed keeps
    stage and status consistent anyway.
