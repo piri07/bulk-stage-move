@@ -102,6 +102,87 @@ How it works:
 - A same-stage click doesn't bump the version (see "Single move" below), so it can't make the job
   skip a deal for no reason.
 
+### Idempotency: one request, one job
+
+A bulk move changes more than stages. Each move writes a history row, bumps the deal's version and
+adds to the job's counters. A duplicate therefore leaves double history, wrong counts and twice the
+database load. Worse, a retry usually arrives _later_, after people have changed things, so it
+re-applies an old intent on top of newer decisions.
+
+The version check can't catch that on its own. A duplicate job takes a fresh snapshot, which
+already includes the changes people made in between, so its version checks pass. Take the Alice
+example again: the manager's request at 10:00 loses its response, Alice wins deal X at 10:03, and
+the client retries at 10:05. Without dedupe, the retry's new job moves X back. Only recognising
+the request stops that.
+
+- The client sends an `Idempotency-Key` header: a UUID created when the user clicks, and reused by
+  every retry of that click. A request without one is rejected with 400, because without it a
+  retry can't be told apart from a deliberate second move.
+- The key is stored on the job row, under `UNIQUE (workspace_id, idempotency_key)`, in the same
+  transaction that creates the job and its snapshot. The job and its key exist together or not at
+  all, and the key survives restarts because it is a committed Postgres row.
+- **Seen key, same request** (compared by a hash of the filter and target stage): the existing job
+  is returned and nothing new is created.
+- **Seen key, different request:** rejected with 422. That is a client bug, and the server won't
+  guess which request was meant.
+- **Two copies at the same instant:** the unique constraint lets one insert win. The other waits
+  for it, then returns the winning job.
+
+Where a retry can still slip through:
+
+- A client that makes a new key for every retry. Each retry then looks like a new click.
+- Two genuine clicks have two keys and run as two jobs. That is by design: the second click is a
+  newer decision.
+
+The other half of idempotency, applying each batch exactly once even when a worker crashes or two
+workers collide, belongs to the batch mechanics described with the worker.
+
+### The job queue is a Postgres table, not Redis or BullMQ
+
+The `bulk_jobs` table _is_ the queue:
+
+- Workers claim a job with `FOR UPDATE SKIP LOCKED`, so two workers asking at once never get the
+  same job.
+- A claim is a lease, renewed after every batch. If a worker dies, its lease expires and another
+  worker takes the job over. A lease epoch that rises on every takeover fences off a stalled
+  worker that wakes up late: its writes are rejected.
+- Each batch moves its deals and saves the job's position and counters in one transaction.
+
+Why not BullMQ on Redis:
+
+1. **It doesn't give us resume.** BullMQ sees a 50,000-deal job as one unit. If the worker dies
+   at 30,000, the job is redelivered whole and starts again from zero. Resuming mid-job needs a
+   checkpoint committed _together with_ the deal updates, which only a Postgres transaction can
+   do. A checkpoint kept in Redis either repeats a batch or skips it, depending on which of the two
+   writes a crash interrupts.
+2. **Creating a job would be two writes to two stores**: the snapshot and key in Postgres, and the
+   message in Redis. A crash between them leaves a job that never runs, or a message with no
+   snapshot behind it.
+3. **It can deliver a job twice anyway.** A worker frozen past its lock (a long garbage-collection
+   pause, say) has its job handed to another worker. The duplicate protection has to live in
+   Postgres regardless.
+4. **Dedupe and progress would be only as durable as Redis's configuration.** Redis can lose its
+   most recent writes in a crash, and BullMQ needs key eviction disabled. In Postgres they are
+   committed rows.
+5. **Per-tenant limits aren't built in.** Open-source BullMQ limits concurrency per worker or per
+   queue. "One running job per workspace" needs BullMQ Pro's groups, a queue per workspace, or
+   custom locks. In Postgres it is one partial unique index.
+6. **It is one more service** to run, size, persist and monitor, and the brief asks for every
+   addition to be justified.
+
+What we give up:
+
+- Millisecond dispatch. That doesn't matter for jobs that run for tens of seconds; workers poll
+  once a second.
+- Built-in retries, replaced by an `attempts` column and lease expiry.
+- A ready-made dashboard, replaced by the progress endpoint, which reads the true state.
+
+A Redis queue is the right tool for large numbers of small, independent tasks that are safe to
+retry on their own and don't commit together with database rows, such as emails and webhooks.
+Bulk stage moves are the opposite: few, heavy jobs whose progress is database data. At larger
+scale the queue isn't what breaks first. If dispatching ever did become a bottleneck, a broker
+could carry the "work on job X" signal while the job's state stays in Postgres.
+
 ## CRM foundation
 
 ### Tenancy
