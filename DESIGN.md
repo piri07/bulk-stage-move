@@ -183,6 +183,76 @@ Bulk stage moves are the opposite: few, heavy jobs whose progress is database da
 scale the queue isn't what breaks first. If dispatching ever did become a bottleneck, a broker
 could carry the "work on job X" signal while the job's state stays in Postgres.
 
+### Scaling
+
+One rule decides the architecture at every size: a job's progress must be committed together
+with the deal updates it describes, so the job lives in the same database as the deals. Whatever
+hands out the work, the work itself is writes to that database. So scaling means making each move
+cheaper, then adding databases. The queue design doesn't change.
+
+"1 billion stage changes" is not one job; jobs stay at 50,000 deals (500,000 in the 10× case). It
+is the total across all tenants, and the period decides everything:
+
+| 1B changes per | Average rate                    | One Postgres server? |
+| -------------- | ------------------------------- | -------------------- |
+| year           | ~32/s                           | Easily               |
+| month          | ~385/s                          | Yes, if well sized   |
+| day            | ~11,600/s, with peaks ~35–60k/s | No                   |
+
+The order to scale in, cheapest first:
+
+1. **Measure** the per-server ceiling (BENCHMARKS.md).
+2. **Make each move cheaper.** Use larger batches written in one statement, and keep the fewest
+   indexes possible on `opportunities`, since a stage change rewrites every one of them. Tune
+   autovacuum for the busy tables.
+3. **Use a bigger server.**
+4. **Partition** `stage_transitions` by month and `bulk_job_items` by day. Old partitions are
+   dropped or archived instead of being deleted row by row.
+5. **Add read replicas** for read traffic, and use change-data-capture for downstream systems
+   (see below).
+6. **Shard by workspace**, putting the largest tenants on shards of their own.
+7. **Possibly move to distributed SQL** (CockroachDB, YugabyteDB, Spanner). It shards
+   automatically, at the price of slower writes and new trade-offs.
+
+**Sharding by workspace:**
+
+- A directory maps each workspace to a shard. Every shard has the full schema, including its own
+  `bulk_jobs` and `bulk_job_items` tables, and its own pool of workers.
+- A bulk move never leaves its workspace, and a workspace never spans shards. So creating a job,
+  running each batch and reading progress are all single-shard transactions. Idempotency keys,
+  batch checkpoints, the version check and "one running job per workspace" keep working unchanged,
+  with no distributed transactions.
+- The code change is small: the API picks a connection pool by workspace, and each worker is
+  started for one shard.
+- Isolation improves: a large tenant's jobs load only its own shard.
+- To move a workspace to another shard:
+  1. Stop new jobs for it.
+  2. Pause its running jobs at a batch boundary.
+  3. Copy its data with logical replication.
+  4. Switch the directory entry.
+  5. Resume the jobs on the new shard. A paused job's cursor is just a row, so it travels with the
+     workspace.
+- Sharding has limits. It can't make one tenant faster than its shard allows. A single job far
+  beyond the cap (say, 100M deals) would need a different approach: splitting one job across
+  workers, or an offline migration.
+
+**Kafka stays out of the write path.** Downstream systems such as analytics, automation and search
+should learn about stage changes through change-data-capture:
+
+- A tool such as Debezium reads committed rows from Postgres's write-ahead log and publishes them
+  to Kafka. `stage_transitions` already has one row per move.
+- Only committed changes get published.
+- Nothing is lost when the reader restarts: it resumes from its position in the log.
+- The CRM's requests never wait on Kafka.
+- At scale, it also takes polling load off the database.
+
+The alternative, having the app write to both Postgres and Kafka, loses or invents events whenever
+a crash falls between the two writes. All of this is out of scope here, since the brief rules out
+downstream consumers.
+
+The brief's own 10× case (a 500,000-deal move in a workspace of 20M deals, and what fails first)
+will be answered with measurements once the job is built.
+
 ## CRM foundation
 
 ### Tenancy
