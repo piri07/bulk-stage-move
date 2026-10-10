@@ -1,8 +1,8 @@
 # Design
 
-This document grows with the code. The bulk stage move is the point of the exercise and gets its
-own sections when it lands. This first version records the assumptions, and the decisions in the
-CRM foundation that the bulk engine builds on.
+This document grows with the code. The bulk stage move is the point of the exercise: its decisions
+are recorded below as they are made, and its mechanics (chunking, the cursor, idempotency,
+isolation) follow as they are built. The CRM foundation it builds on comes last.
 
 ## Assumptions
 
@@ -33,6 +33,74 @@ CRM foundation that the bulk engine builds on.
 5. **Owners are opaque UUIDs.** There is no users table.
 6. **Deals are never deleted.** Nothing in scope removes one.
 7. **Tenancy comes from the `X-Workspace-Id` header**, with no auth, as the brief allows.
+
+## Bulk stage move
+
+A user picks a filter (stage, owner, status, value range, date range) and a target stage, and
+moves up to 50,000 matching deals in one action. The API answers at once with a job id, a
+background worker does the moving, and the user polls for progress.
+
+### Which deals: the snapshot, not the live set
+
+When the user clicks, the filter matches a set of deals. The job then takes a while, and meanwhile
+people keep editing: some deals start matching the filter, others stop. The job works on the
+**snapshot**: the deals that matched at the moment of the click, frozen into a list.
+
+The alternative, the **live set**, re-evaluates the filter as the job goes. That makes the job
+non-deterministic:
+
+- It walks the deals in id order. A deal that starts matching mid-job is moved only if its id
+  happens to be ahead of the job's position, so two identical runs can produce different results.
+- The total keeps changing, so progress can't honestly be shown as "x of N", and the 50,000 cap
+  stops meaning anything.
+
+The snapshot gives:
+
+- exactly the deals the user was shown ("12,345 deals will be moved"), no more and no fewer
+- a fixed total, so progress is honest and the cap is checked once, at submission
+- an auditable result: every deal on the list ends with a recorded outcome
+- a simple resume after a crash: a list, plus a position in it
+
+The consequences, accepted:
+
+- A deal that starts matching after the click is not moved. Running the same move again picks it
+  up. That is safe, because deals already in the target stage are not selected.
+- The list has to be stored: about 50,000 small rows per job.
+
+### Collisions: the person always wins
+
+While the job runs, people keep moving deals by hand, including deals on the job's list.
+Permissions (RBAC) would make this rarer but not impossible: the deal's owner and the manager
+running the job are both allowed to move it. RBAC decides _who may_ edit a deal, not _what
+happens_ when two permitted people edit it at the same time. (Auth is out of scope here anyway.)
+
+An example:
+
+- **10:00** A manager starts "move Alice's `negotiation` deals → `contract_sent`". Deal X is on
+  the list.
+- **10:01** The customer signs, and Alice marks deal X `closed_won`.
+- **10:02** The job reaches deal X.
+
+| Option                                    | Deal X ends up                                  | Why not                                                                                                                                                                                                   |
+| ----------------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The job overwrites                        | `contract_sent`: Alice's win is silently undone | A lost update. A decision made on 10:00 information erases a 10:01 decision, and nobody is told.                                                                                                          |
+| Block manual edits until the job finishes | Alice's 10:01 move is rejected                  | It defeats the purpose: if people must wait anyway, the job might as well be a loop. It also means errors for the whole run, locks left behind if a worker dies, and an extra check on every manual move. |
+| **The person wins** (chosen)              | `closed_won`; the job skips X and reports it    |                                                                                                                                                                                                           |
+
+How it works:
+
+- When the list is taken, each deal's `version` is recorded with it.
+- The job moves a deal only if its `version` is still the same. The check happens inside the same
+  `UPDATE` that moves the deal (a compare-and-set), so nothing can slip in between checking and
+  writing.
+- If a person moved the deal after the click, its version has changed. The job skips it and
+  records it as skipped because of a newer manual change. The user sees those deals in the job's
+  result, and can run the move again if they still want them moved.
+- If the job moves a deal first and a person moves it afterwards, the person's move simply applies
+  on top. In either order, the deal ends where the person put it.
+- Manual moves are never rejected because a job is running.
+- A same-stage click doesn't bump the version (see "Single move" below), so it can't make the job
+  skip a deal for no reason.
 
 ## CRM foundation
 
