@@ -29,10 +29,11 @@ export interface Page<T> {
 }
 
 /**
- * Builds a page from a query that fetched `limit + 1` rows in id order. The extra row only
+ * Builds a page from a query that fetched `limit + 1` rows in cursor order. The extra row only
  * signals that another page exists, which saves a COUNT.
  */
-export function toPage<T extends { id: number }>(rows: T[], limit: number): Page<T> {
+export function toPage<T>(rows: T[], limit: number, cursorOf: (row: T) => number): Page<T> {
   const items = rows.slice(0, limit);
-  return { items, nextCursor: rows.length > limit ? (items.at(-1)?.id ?? null) : null };
+  const last = items.at(-1);
+  return { items, nextCursor: rows.length > limit && last ? cursorOf(last) : null };
 }

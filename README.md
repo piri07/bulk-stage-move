@@ -4,7 +4,12 @@ A slice of a CRM's opportunities (deals) service, built around one hard operatio
 50,000 deals to another stage as a background job that is idempotent, resumable and polite to
 everything else running. [DESIGN.md](DESIGN.md) has the reasoning.
 
-**Status:** Part 1, the CRM foundation, is done. Part 2, the bulk engine, is next.
+**Status:**
+
+- Part 1, the CRM foundation, is done.
+- Part 2, the bulk engine, is in progress. Idempotent submission and the resumable Postgres worker
+  are done. Still to come: progress health (slow, stuck or failed), isolation (pacing and
+  fairness) and the benchmarks.
 
 ## Run it
 
@@ -21,6 +26,7 @@ That one command:
 3. seeds a small dataset
 4. runs the test suite once (see the `test-1` lines in the output)
 5. serves the API on http://localhost:3000
+6. starts the bulk-move worker, a separate process that runs submitted jobs
 
 ```bash
 curl localhost:3000/health    # {"status":"ok","db":"ok"}
@@ -61,20 +67,43 @@ is concentrated where behaviour is subtle:
 - a deal's stage history, read oldest first and page by page
 - 10 concurrent moves of one deal. They must leave an unbroken transition chain, so this test
   fails if the row lock is removed.
+- bulk submission: the snapshot, every filter criterion, the 50,000 cap, and idempotency (repeated
+  keys, a key reused for a different request, and a duplicate arriving while the original is
+  still in flight)
+- the worker: every deal moved exactly once; deals a person moved after the click are skipped,
+  including when that move commits while a batch waits for the row; resuming after a crash
+  mid-batch; refusing writes from a replaced worker; one running job per workspace; retries,
+  graceful handover and giving up
+
+Each of the bulk safety mechanisms was checked by removing it: the version check, the lease-epoch
+fence, and the idempotency unique constraint. Every removal makes its test fail.
 
 ## API
 
-The `/opportunities` routes require an `X-Workspace-Id` header containing a UUID. There is no auth.
+The `/opportunities` and `/bulk-moves` routes require an `X-Workspace-Id` header containing a
+UUID. There is no auth.
 
-| Method  | Path                                            | Body / notes                                                |
-| ------- | ----------------------------------------------- | ----------------------------------------------------------- |
-| `GET`   | `/health`                                       | liveness and a database ping (503 if unreachable)           |
-| `GET`   | `/stages`                                       | the fixed pipeline, in order                                |
-| `POST`  | `/opportunities`                                | `{ name, valueCents, ownerId, stage?, status? }`            |
-| `GET`   | `/opportunities?stage=&limit=&cursor=`          | one page of a stage; pass `nextCursor` back as `cursor`     |
-| `GET`   | `/opportunities/:id`                            |                                                             |
-| `GET`   | `/opportunities/:id/transitions?limit=&cursor=` | the deal's stage history, oldest first, paged like the list |
-| `PATCH` | `/opportunities/:id/stage`                      | `{ stage, expectedVersion? }`; 409 if the version is stale  |
+| Method  | Path                                            | Body / notes                                                                 |
+| ------- | ----------------------------------------------- | ---------------------------------------------------------------------------- |
+| `GET`   | `/health`                                       | liveness and a database ping (503 if unreachable)                            |
+| `GET`   | `/stages`                                       | the fixed pipeline, in order                                                 |
+| `POST`  | `/opportunities`                                | `{ name, valueCents, ownerId, stage?, status? }`                             |
+| `GET`   | `/opportunities?stage=&limit=&cursor=`          | one page of a stage; pass `nextCursor` back as `cursor`                      |
+| `GET`   | `/opportunities/:id`                            |                                                                              |
+| `GET`   | `/opportunities/:id/transitions?limit=&cursor=` | the deal's stage history, oldest first, paged like the list                  |
+| `PATCH` | `/opportunities/:id/stage`                      | `{ stage, expectedVersion? }`; 409 if the version is stale                   |
+| `POST`  | `/bulk-moves`                                   | `{ filter, targetStage }` plus an `Idempotency-Key` header; 202 with the job |
+| `GET`   | `/bulk-moves/:id`                               | the job: status, total, processed, moved, skipped                            |
+| `GET`   | `/bulk-moves/:id/items?outcome=&limit=&cursor=` | the job's deals and what happened to each                                    |
+
+A bulk move's `filter` takes any combination of these criteria; `{}` means the whole workspace:
+
+- `stages`, `ownerIds` and `statuses` are lists, and a deal matches any value in a list.
+- `minValueCents` and `maxValueCents` are inclusive.
+- `createdFrom` is inclusive and `createdTo` is exclusive.
+
+Deals already in the target stage are left out. A filter matching more than 50,000 deals is a 422. A repeated `Idempotency-Key` returns the original job with an `Idempotent-Replayed: true`
+header, while the same key with a different request is a 422.
 
 ```bash
 WS=00000000-0000-4000-8000-000000000002   # Small Co 1
@@ -85,6 +114,13 @@ curl -s -X PATCH "localhost:3000/opportunities/$ID/stage" -H "x-workspace-id: $W
   -H 'content-type: application/json' -d '{"stage":"proposal_sent"}'
 
 curl -s "localhost:3000/opportunities/$ID/transitions" -H "x-workspace-id: $WS"
+
+# Bulk move: every qualified deal to proposal_sent, then watch the job.
+JOB=$(curl -s -X POST localhost:3000/bulk-moves -H "x-workspace-id: $WS" \
+  -H "idempotency-key: $(uuidgen)" -H 'content-type: application/json' \
+  -d '{"filter":{"stages":["qualified"]},"targetStage":"proposal_sent"}' | jq .id)
+curl -s "localhost:3000/bulk-moves/$JOB" -H "x-workspace-id: $WS"
+curl -s "localhost:3000/bulk-moves/$JOB/items?outcome=skipped_conflict" -H "x-workspace-id: $WS"
 ```
 
 ## Configuration
@@ -96,6 +132,14 @@ curl -s "localhost:3000/opportunities/$ID/transitions" -H "x-workspace-id: $WS"
 | `DB_POOL_MAX`             | `10`                                         |                                              |
 | `DB_STATEMENT_TIMEOUT_MS` | `5000`                                       | `0` disables it                              |
 | `TEST_DATABASE_URL`       | `postgres://crm:crm@localhost:5433/crm_test` | must end in `_test`: it is dropped every run |
+| `BULK_MAX_DEALS`          | `50000`                                      | the most deals one bulk move may cover       |
+| `WORKER_BATCH_SIZE`       | `500`                                        | deals per batch (one transaction)            |
+| `WORKER_LEASE_MS`         | `15000`                                      | how soon a dead worker's job is taken over   |
+| `WORKER_POLL_MS`          | `1000`                                       | how often an idle worker looks for a job     |
+| `WORKER_MAX_ATTEMPTS`     | `5`                                          | failed runs before a job is marked failed    |
+| `WORKER_RETRY_BACKOFF_MS` | `2000`                                       | first retry delay; doubles each failure      |
+| `WORKER_LOCK_TIMEOUT_MS`  | `2000`                                       | how long a batch waits for a row lock        |
+| `WORKER_ID`               | `hostname:pid`                               | shown as the job's lease owner               |
 
 Compose publishes Postgres on host port 5433 (`PG_PORT`) and the API on 3000 (`API_PORT`).
 
@@ -111,12 +155,22 @@ Compose publishes Postgres on host port 5433 (`PG_PORT`) and the API on 3000 (`A
 - tests
 - the one-command compose setup
 
-**Not yet:** the bulk stage move (Part 2) and the benchmarks:
+**Done:** the bulk stage move (Part 2) so far:
 
-- job submission with idempotency keys
-- a resumable worker
-- a progress endpoint
-- per-workspace isolation
+- submission with an idempotency key, a hash of the request and a 50,000-deal cap, creating the
+  job and its snapshot in one transaction
+- a separate worker process that claims jobs with `FOR UPDATE SKIP LOCKED` and holds a lease
+  fenced by an epoch
+- each batch's moves, outcomes and checkpoint committed in one transaction
+- the "person wins" version check
+- one running job per workspace
+- retries with backoff, graceful handover on `SIGTERM`, and giving up after repeated failures
+- a job's status and its per-deal outcomes, readable through the API
+
+**Not yet:**
+
+- progress health that tells slow, stuck and failed apart
+- isolation: pacing and cross-workspace fairness
 - `BENCHMARKS.md`
 
 **Deliberately not built:** rules on the transition sequence. Any stage can move to any other,
@@ -129,7 +183,9 @@ automation events, deployment.
 
 ```
 src/crm/        pipeline (stages), opportunities controller / service / repository, DTOs
-src/common/     workspace guard, id pipe
+src/bulk/       bulk-move submission: idempotency, filter, snapshot, job and item reads
+src/worker/     the worker process: claiming, leases, batches and checkpoints
+src/common/     workspace guard, id pipe, pagination
 src/db/         pool, migration runner, transaction helper, pg error helpers
 src/scripts/    seed
 migrations/     plain SQL, applied in filename order

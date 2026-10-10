@@ -10,6 +10,7 @@
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
+    "worker": "node dist/worker/main.js",
     "migrate": "node dist/db/migrate.js",
     "seed": "node dist/scripts/seed.js",
     "test": "jest --runInBand",

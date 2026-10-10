@@ -88,7 +88,7 @@ export class OpportunitiesService {
       query.cursor ?? 0,
       query.limit + 1,
     );
-    return toPage(rows, query.limit);
+    return toPage(rows, query.limit, (row) => row.id);
   }
 
   async listTransitions(
@@ -105,6 +105,6 @@ export class OpportunitiesService {
       query.cursor ?? 0,
       query.limit + 1,
     );
-    return toPage(rows, query.limit);
+    return toPage(rows, query.limit, (row) => row.id);
   }
 }

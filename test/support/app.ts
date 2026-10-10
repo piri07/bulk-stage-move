@@ -3,15 +3,19 @@ import { Test } from '@nestjs/testing';
 import { randomUUID } from 'node:crypto';
 import type { Pool } from 'pg';
 import { AppModule } from '../../src/app.module';
-import { APP_CONFIG, loadConfig, type AppConfig } from '../../src/config';
+import { APP_CONFIG, loadConfig, type AppConfig, type BulkConfig } from '../../src/config';
 import { PG_POOL } from '../../src/db/database.module';
 import { TEST_DATABASE_URL } from './database';
 
 /** Boots the real AppModule (pipes, guards, pool) against the test database. */
-export async function startApp(): Promise<{ app: INestApplication; pool: Pool }> {
+export async function startApp(
+  overrides: { bulk?: Partial<BulkConfig> } = {},
+): Promise<{ app: INestApplication; pool: Pool }> {
+  const defaults = loadConfig();
   const config: AppConfig = {
-    ...loadConfig(),
+    ...defaults,
     database: { url: TEST_DATABASE_URL, poolMax: 20, statementTimeoutMs: 5000 },
+    bulk: { ...defaults.bulk, ...overrides.bulk },
   };
   const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
     .overrideProvider(APP_CONFIG)

@@ -57,5 +57,14 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  worker:
+    <<: *app
+    command: ['node', 'dist/worker/main.js']
+    # On `docker compose stop` the worker finishes its batch in flight and hands its job back.
+    stop_grace_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
 volumes:
   pgdata:

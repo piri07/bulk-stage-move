@@ -87,14 +87,14 @@ export async function updateOpportunityStage(
   return oneRow(rows);
 }
 
-export type TransitionSource = 'manual';
+export type TransitionSource = 'manual' | 'bulk';
 
 export interface NewStageTransition {
   workspaceId: string;
   opportunityId: number;
   fromStage: Stage;
   toStage: Stage;
-  source: TransitionSource;
+  source: 'manual';
 }
 
 export interface StageTransition {
@@ -102,6 +102,8 @@ export interface StageTransition {
   fromStage: Stage;
   toStage: Stage;
   source: TransitionSource;
+  /** The bulk job that made this move; null for a manual move. */
+  bulkJobId: number | null;
   createdAt: Date;
 }
 
@@ -134,7 +136,8 @@ export async function listStageTransitions(
   limit: number,
 ): Promise<StageTransition[]> {
   const { rows } = await db.query<StageTransition>(
-    `SELECT id, from_stage AS "fromStage", to_stage AS "toStage", source, created_at AS "createdAt"
+    `SELECT id, from_stage AS "fromStage", to_stage AS "toStage", source,
+            bulk_job_id AS "bulkJobId", created_at AS "createdAt"
        FROM stage_transitions
       WHERE opportunity_id = $1 AND workspace_id = $2 AND id > $3
       ORDER BY id
