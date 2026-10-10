@@ -1,4 +1,4 @@
-.PHONY: up down db migrate test psql logs
+.PHONY: up down db migrate seed seed-full test psql logs
 
 up: ## Build and start the whole stack
 	docker compose up --build
@@ -11,6 +11,12 @@ db: ## Start only Postgres (to run the API or tests on the host)
 
 migrate: ## Apply pending SQL migrations
 	docker compose run --rm migrate
+
+seed: ## Seed the small dataset (skips workspaces that already exist)
+	docker compose run --rm seed
+
+seed-full: ## Wipe and seed the full dataset: 500k deals + 5 small workspaces
+	docker compose run --rm seed node dist/scripts/seed.js --full --reset
 
 test: ## Run the test suite in a container against a throwaway crm_test database
 	docker compose run --rm --build test

@@ -31,6 +31,14 @@ services:
       postgres:
         condition: service_healthy
 
+  seed:
+    <<: *app
+    # Small dataset on `up`; skips workspaces that already exist. Full: `make seed-full`.
+    command: ['node', 'dist/scripts/seed.js', '--small']
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
   test:
     <<: *app
     command: ['npm', 'test']
