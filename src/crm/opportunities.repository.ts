@@ -53,6 +53,65 @@ export async function findOpportunity(
   return rows[0];
 }
 
+/** Row-locks the deal until the surrounding transaction ends; concurrent movers queue here. */
+export async function findOpportunityForUpdate(
+  tx: Queryable,
+  workspaceId: string,
+  id: number,
+): Promise<Opportunity | undefined> {
+  const { rows } = await tx.query<Opportunity>(
+    `SELECT ${OPPORTUNITY_COLUMNS}
+       FROM opportunities
+      WHERE id = $1 AND workspace_id = $2
+        FOR UPDATE`,
+    [id, workspaceId],
+  );
+  return rows[0];
+}
+
+// clock_timestamp(), not now(): now() is the transaction's start time, which for a transaction that
+// queued on the row lock can be earlier than the write it waited behind.
+export async function updateOpportunityStage(
+  tx: Queryable,
+  workspaceId: string,
+  id: number,
+  stage: Stage,
+): Promise<Opportunity> {
+  const { rows } = await tx.query<Opportunity>(
+    `UPDATE opportunities
+        SET stage = $3, version = version + 1, updated_at = clock_timestamp()
+      WHERE id = $1 AND workspace_id = $2
+      RETURNING ${OPPORTUNITY_COLUMNS}`,
+    [id, workspaceId, stage],
+  );
+  return oneRow(rows);
+}
+
+export interface NewStageTransition {
+  workspaceId: string;
+  opportunityId: number;
+  fromStage: Stage;
+  toStage: Stage;
+  source: 'manual';
+}
+
+export async function insertStageTransition(
+  tx: Queryable,
+  transition: NewStageTransition,
+): Promise<void> {
+  await tx.query(
+    `INSERT INTO stage_transitions (workspace_id, opportunity_id, from_stage, to_stage, source, created_at)
+     VALUES ($1, $2, $3, $4, $5, clock_timestamp())`,
+    [
+      transition.workspaceId,
+      transition.opportunityId,
+      transition.fromStage,
+      transition.toStage,
+      transition.source,
+    ],
+  );
+}
+
 /**
  * One page of a stage in id order. Keyset pagination on (workspace_id, stage, id): each page is an
  * index range scan whose cost does not grow with page depth, and rows moving in or out of the

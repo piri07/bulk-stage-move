@@ -1,8 +1,8 @@
-import { Body, Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { ParseIdPipe } from '../common/parse-id.pipe';
 import { WorkspaceGuard, WorkspaceId } from '../common/workspace';
 // DTOs must be value imports: ValidationPipe finds them through emitted decorator metadata.
-import { CreateOpportunityDto, ListOpportunitiesQuery } from './dto';
+import { CreateOpportunityDto, ListOpportunitiesQuery, MoveStageDto } from './dto';
 import type { Opportunity } from './opportunities.repository';
 import { OpportunitiesService, type OpportunityPage } from './opportunities.service';
 
@@ -33,5 +33,14 @@ export class OpportunitiesController {
     @Param('id', ParseIdPipe) id: number,
   ): Promise<Opportunity> {
     return this.opportunities.get(workspaceId, id);
+  }
+
+  @Patch(':id/stage')
+  moveStage(
+    @WorkspaceId() workspaceId: string,
+    @Param('id', ParseIdPipe) id: number,
+    @Body() dto: MoveStageDto,
+  ): Promise<Opportunity> {
+    return this.opportunities.moveStage(workspaceId, id, dto);
   }
 }

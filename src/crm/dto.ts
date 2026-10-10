@@ -31,6 +31,18 @@ export class CreateOpportunityDto {
   status?: Status;
 }
 
+export class MoveStageDto {
+  @IsIn(STAGES)
+  stage!: Stage;
+
+  /** Optimistic concurrency: when given, the move only applies if the deal is still at it. */
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(2_147_483_647)
+  expectedVersion?: number;
+}
+
 export class ListOpportunitiesQuery {
   @IsIn(STAGES)
   stage!: Stage;
