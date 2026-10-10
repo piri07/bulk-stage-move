@@ -11,6 +11,7 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
     "migrate": "node dist/db/migrate.js",
+    "test": "jest --runInBand",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
     "format": "prettier --write .",
@@ -28,13 +29,38 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@nestjs/testing": "^11.2.7",
     "@types/express": "^5.0.6",
+    "@types/jest": "^30.0.0",
     "@types/node": "^22.20.5",
     "@types/pg": "^8.23.1",
+    "@types/supertest": "^7.2.1",
     "eslint": "^10.12.0",
     "eslint-config-prettier": "^10.1.8",
+    "jest": "^30.5.2",
     "prettier": "^3.9.10",
+    "supertest": "^7.3.1",
+    "ts-jest": "^29.4.14",
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.71.1"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "roots": [
+      "<rootDir>/test"
+    ],
+    "testMatch": [
+      "**/*.spec.ts"
+    ],
+    "transform": {
+      "^.+\\.ts$": [
+        "ts-jest",
+        {
+          "tsconfig": "tsconfig.json"
+        }
+      ]
+    },
+    "globalSetup": "<rootDir>/test/global-setup.ts",
+    "testTimeout": 30000
   }
 }

@@ -31,6 +31,16 @@ services:
       postgres:
         condition: service_healthy
 
+  test:
+    <<: *app
+    command: ['npm', 'test']
+    environment:
+      # A separate database, dropped and re-migrated at the start of every run.
+      TEST_DATABASE_URL: postgres://crm:crm@postgres:5432/crm_test
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     <<: *app
     ports:

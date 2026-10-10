@@ -6,7 +6,7 @@
     "moduleResolution": "nodenext",
     "rootDir": ".",
     "outDir": "dist",
-    "types": ["node"],
+    "types": ["node", "jest"],
 
     "strict": true,
     "noUncheckedIndexedAccess": true,
