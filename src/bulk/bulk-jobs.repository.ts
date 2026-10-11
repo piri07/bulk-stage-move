@@ -172,8 +172,8 @@ export async function findProgressRow(
             j.lease_owner AS "leaseOwner", j.last_progress_at AS "lastProgressAt",
             extract(epoch FROM now() - j.last_progress_at)::float8 AS "secondsSinceProgress",
             extract(epoch FROM j.lease_expires_at - now())::float8 AS "leaseSecondsLeft",
-            extract(epoch FROM now() - coalesce(j.started_at, j.created_at))::float8
-              AS "secondsSinceStart",
+            extract(epoch FROM coalesce(j.finished_at, now())
+                               - coalesce(j.started_at, j.created_at))::float8 AS "elapsedSeconds",
             extract(epoch FROM now() - j.created_at)::float8 AS "secondsSinceCreated",
             j.started_at IS NOT NULL AS started,
             (SELECT r.id FROM bulk_jobs r

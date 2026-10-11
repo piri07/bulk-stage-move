@@ -183,6 +183,56 @@ Bulk stage moves are the opposite: few, heavy jobs whose progress is database da
 scale the queue isn't what breaks first. If dispatching ever did become a bottleneck, a broker
 could carry the "work on job X" signal while the job's state stays in Postgres.
 
+### Progress: slow, stuck or failed
+
+The brief asks for progress that reports real committed state, and that lets the user tell slow,
+stuck and failed apart.
+
+**Committed state, not counters in memory.** `GET /bulk-moves/:id/progress` reads one row: the
+cursor and counters the worker commits in the same transaction as each batch. After any restart
+they are exactly right, because there is nothing in memory to lose.
+
+**Health is derived on the server** from columns already on the row: status, the lease owner and
+its expiry, the time of the last progress, attempts and the last error. Every client gets the
+same answer, and no new state is stored.
+
+| Health                | Rule                                                                                                                                          |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `queued`              | Pending, or handed back (no lease owner, lease lapsed). The detail gives the reason: this workspace's other job, or waiting for a free worker |
+| `active`              | A worker holds the lease, and a batch committed less than 2s ago                                                                              |
+| `slow`                | A worker holds the lease, but no batch has committed for 2s or more. A batch normally commits every ~50ms                                     |
+| `retrying`            | No owner, the lease still in the future, and an error recorded: the job is waiting out its backoff                                            |
+| `stalled`             | An owner whose lease has expired: that worker died or froze, and another will take over                                                       |
+| `stuck`               | Queued or stalled for more than two lease lengths (30s) while no worker holds any lease anywhere                                              |
+| `failed`, `completed` | Final                                                                                                                                         |
+
+- **It uses Postgres's clock, not the API's.** Durations are computed in SQL against `now()`, the
+  same clock that wrote the timestamps, so a skewed API clock can't make a healthy job look
+  stalled.
+- **Rate and ETA are averages since the job started**, waits included. A finished job's rate is
+  measured up to `finished_at`, so it doesn't keep falling afterwards.
+
+**What polling costs, and the poll limit.** A poll is one primary-key read of a small table. It
+takes no locks and can't block the worker, because Postgres readers never wait for writers. The
+risk is a client polling in a tight loop: one API process serves every workspace. So a job's
+state can be read once every 2 seconds, whoever asks. A faster poll costs an in-memory check and
+gets 429 with `Retry-After`, and responses carry `pollAfterMs`.
+
+- **Why per job, and not per workspace or one global budget.** A single global budget would let
+  one noisy client block everyone, and per-workspace quotas weren't needed.
+- **The key is workspace plus job**, so a request naming the wrong workspace can't use up the
+  owner's allowance.
+- **The limit is shared by `/bulk-moves/:id` and `/progress`**, so alternating between them
+  doesn't get around it.
+
+Trade-offs:
+
+- The limit lives in each API instance. With several instances, each enforces its own interval; a
+  shared store or the gateway would make it exact.
+- It protects job polling only. General API rate limiting belongs at the gateway.
+- Server-sent events would remove polling altogether, but they are more machinery than the brief
+  warrants.
+
 ### Isolation: polite to everything else
 
 The brief: a bulk move must not starve interactive requests in its own workspace, and must not

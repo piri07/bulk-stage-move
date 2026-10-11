@@ -7,9 +7,13 @@ everything else running. [DESIGN.md](DESIGN.md) has the reasoning.
 **Status:**
 
 - Part 1, the CRM foundation, is done.
-- Part 2, the bulk engine, is in progress. Done: idempotent submission, the resumable Postgres
-  worker, pacing and fairness between workspaces. Still to come: progress health (slow, stuck or
-  failed) and the benchmarks.
+- Part 2, the bulk engine, is in progress. Done:
+  - idempotent submission
+  - the resumable Postgres worker
+  - pacing and fairness between workspaces
+  - a rate-limited progress endpoint that tells slow, stuck and failed apart
+
+  Still to come: the benchmarks.
 
 ## Run it
 
@@ -77,10 +81,12 @@ is concentrated where behaviour is subtle:
 - isolation: the speed limit, round-robin turns between workspaces, and a long job handed back
   after its time slice so another workspace's job runs
 - the database pool surviving Postgres closing its connections
+- progress: every health state (unit tests on the rules, plus a real job followed from queued to
+  active to stalled to completed), a finished job's rate staying fixed, and the per-job poll limit
 
 Each safety mechanism was checked by removing it: the version check, the lease-epoch fence, the
-idempotency unique constraint, the pool's error handler, pacing, round-robin turns and time
-slicing. Every removal makes its test fail.
+idempotency unique constraint, the pool's error handler, pacing, round-robin turns, time slicing
+and the poll limit. Every removal makes its test fail.
 
 ## API
 
@@ -98,6 +104,7 @@ UUID. There is no auth.
 | `PATCH` | `/opportunities/:id/stage`                      | `{ stage, expectedVersion? }`; 409 if the version is stale                   |
 | `POST`  | `/bulk-moves`                                   | `{ filter, targetStage }` plus an `Idempotency-Key` header; 202 with the job |
 | `GET`   | `/bulk-moves/:id`                               | the job: status, total, processed, moved, skipped                            |
+| `GET`   | `/bulk-moves/:id/progress`                      | the one to poll: health, detail, counts, rate, ETA, `pollAfterMs`            |
 | `GET`   | `/bulk-moves/:id/items?outcome=&limit=&cursor=` | the job's deals and what happened to each                                    |
 
 A bulk move's `filter` takes any combination of these criteria; `{}` means the whole workspace:
@@ -108,6 +115,22 @@ A bulk move's `filter` takes any combination of these criteria; `{}` means the w
 
 Deals already in the target stage are left out. A filter matching more than 50,000 deals is a 422. A repeated `Idempotency-Key` returns the original job with an `Idempotent-Replayed: true`
 header, while the same key with a different request is a 422.
+
+**Progress** reports a job's `health`, always with a plain-language `detail`:
+
+| `health`    | Meaning                                                           |
+| ----------- | ----------------------------------------------------------------- |
+| `queued`    | waiting for a worker (and why)                                    |
+| `active`    | moving                                                            |
+| `slow`      | its worker holds it, but no batch has committed for 2s or more    |
+| `retrying`  | a batch failed; it shows when the next attempt is due             |
+| `stalled`   | its worker stopped; another will take over                        |
+| `stuck`     | waiting or stalled for a long time with no worker active anywhere |
+| `failed`    | gave up; the error, and how far it got                            |
+| `completed` | done                                                              |
+
+A job's state can be read once every 2 seconds, whoever asks. A faster poll gets `429` with
+`Retry-After`, and the limit is shared by `/bulk-moves/:id` and `/bulk-moves/:id/progress`.
 
 ```bash
 WS=00000000-0000-4000-8000-000000000002   # Small Co 1
@@ -137,6 +160,7 @@ curl -s "localhost:3000/bulk-moves/$JOB/items?outcome=skipped_conflict" -H "x-wo
 | `DB_STATEMENT_TIMEOUT_MS`     | `5000`                                       | `0` disables it                                           |
 | `TEST_DATABASE_URL`           | `postgres://crm:crm@localhost:5433/crm_test` | must end in `_test`: it is dropped every run              |
 | `BULK_MAX_DEALS`              | `50000`                                      | the most deals one bulk move may cover                    |
+| `BULK_POLL_INTERVAL_MS`       | `2000`                                       | a job's state can be read once per interval               |
 | `WORKER_BATCH_SIZE`           | `500`                                        | deals per batch (one transaction)                         |
 | `WORKER_LEASE_MS`             | `15000`                                      | how soon a dead worker's job is taken over                |
 | `WORKER_POLL_MS`              | `1000`                                       | how often an idle worker looks for a job                  |
@@ -172,16 +196,15 @@ Compose publishes Postgres on host port 5433 (`PG_PORT`) and the API on 3000 (`A
 - one running job per workspace
 - retries with backoff, graceful handover on `SIGTERM`, and giving up after repeated failures
 - a job's status and its per-deal outcomes, readable through the API
+- a progress endpoint with derived health (slow, stuck and failed told apart), throughput and
+  ETA, limited to one read per job every 2 seconds
 - isolation:
   - a separate connection pool for the worker
   - pacing at 10,000 deals/s per job (and so per workspace)
   - round-robin turns between workspaces
   - time slicing, so a long job hands its worker back while other workspaces wait
 
-**Not yet:**
-
-- progress health that tells slow, stuck and failed apart
-- `BENCHMARKS.md`
+**Not yet:** `BENCHMARKS.md`.
 
 **Deliberately not built:** rules on the transition sequence. Any stage can move to any other,
 including backwards and reopening closed deals; see DESIGN.md, assumption 2.

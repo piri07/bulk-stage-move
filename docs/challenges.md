@@ -124,6 +124,17 @@ pass.
   measured from the scheduled time), so stalls can't hide. Even so, a benchmark can mislead
   through phase order and too little load.
 
+### A finished job's speed kept falling
+
+- **Problem:** watching a real 50,000-deal job through the new progress endpoint, its
+  `dealsPerSecond` kept dropping after it had completed: 8,041, then 5,981 a couple of seconds
+  later.
+- **Cause:** the rate divided the deals processed by the time since the job started, up to _now_,
+  even for a job that had already finished.
+- **Fix:** a finished job's rate is measured up to `finished_at`. An end-to-end test now polls a
+  completed job twice, a poll interval apart, and expects the same rate. Reverting the fix makes
+  it fail.
+
 ### Docker doesn't remove a CPU limit the way I expected
 
 - **Problem:** to emulate a smaller database, I limited Postgres to 2 CPUs with

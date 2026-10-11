@@ -32,8 +32,12 @@ export interface ProgressRow {
   secondsSinceProgress: number | null;
   /** Negative once the lease has expired; null when there is no lease. */
   leaseSecondsLeft: number | null;
-  /** Since the job first started, or since it was created if it hasn't. */
-  secondsSinceStart: number;
+  /**
+   * How long the job has been running: from its start (or creation, if it hasn't started) until
+   * it finished, or until now while it hasn't. A finished job's rate must not keep falling as
+   * time passes.
+   */
+  elapsedSeconds: number;
   secondsSinceCreated: number;
   started: boolean;
   /** Another running job of the same workspace, which this one is queued behind. */
@@ -81,8 +85,8 @@ export function describeProgress(row: ProgressRow, settings: ProgressSettings): 
   const finished = row.status === 'completed' || row.status === 'failed';
   const { health, detail, retryInSeconds = null } = classify(row, settings);
   const rate =
-    row.started && row.processed > 0 && row.secondsSinceStart > 0
-      ? row.processed / row.secondsSinceStart
+    row.started && row.processed > 0 && row.elapsedSeconds > 0
+      ? row.processed / row.elapsedSeconds
       : null;
   return {
     jobId: row.id,

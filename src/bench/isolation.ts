@@ -116,7 +116,7 @@ async function openLoop(
  * Keeps a bulk job running until `until`: the same ~50,000 Large Co deals alternate between two
  * stages, one job after another. Returns once the last job has finished.
  */
-async function runBulkJobs(until: number, createdTo: string): Promise<BulkResult> {
+async function runBulkJobs(pool: Pool, until: number, createdTo: string): Promise<BulkResult> {
   const headers = { 'x-workspace-id': LARGE_WORKSPACE_ID, 'content-type': 'application/json' };
   const result: BulkResult = { jobs: 0, moved: 0, jobSeconds: [] };
   let target = BULK_STAGES[0];
@@ -141,8 +141,13 @@ async function runBulkJobs(until: number, createdTo: string): Promise<BulkResult
         );
       }
       await sleep(100);
-      const res = await fetch(`${API_URL}/bulk-moves/${id}`, { headers });
-      job = (await res.json()) as { status: string; moved: number };
+      // Read straight from the database: the API allows one poll per job every 2s, too coarse
+      // to time a job that finishes in a few seconds.
+      const { rows } = await pool.query<{ status: string; moved: number }>(
+        'SELECT status, moved_count AS moved FROM bulk_jobs WHERE id = $1',
+        [id],
+      );
+      job = rows[0] ?? job;
     }
     if (job.status !== 'completed') throw new Error(`bulk job ${id} ended as ${job.status}`);
 
@@ -159,10 +164,10 @@ async function runPhase(
   groups: Group[],
   seconds: number,
   rate: number,
-  bulk?: { createdTo: string },
+  bulk?: { pool: Pool; createdTo: string },
 ): Promise<PhaseResult> {
   const until = performance.now() + seconds * 1000;
-  const bulkRun = bulk ? runBulkJobs(until, bulk.createdTo) : Promise.resolve(undefined);
+  const bulkRun = bulk ? runBulkJobs(bulk.pool, until, bulk.createdTo) : Promise.resolve(undefined);
   const loads = await Promise.all(
     groups.map((group) => openLoop(rate, seconds, () => interactiveRequest(group))),
   );
@@ -292,7 +297,7 @@ async function main(): Promise<void> {
       const baseline = (): Promise<PhaseResult> =>
         runPhase(`no bulk job #${round}`, groups, seconds, rate);
       const bulk = (): Promise<PhaseResult> =>
-        runPhase(`bulk running #${round}`, groups, seconds, rate, { createdTo });
+        runPhase(`bulk running #${round}`, groups, seconds, rate, { pool, createdTo });
       if (round % 2 === 1) phases.push(await baseline(), await bulk());
       else phases.push(await bulk(), await baseline());
     }
