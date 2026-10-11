@@ -250,7 +250,7 @@ nothing per deal, but Postgres does a lot:
 - It writes all of the above to the write-ahead log and flushes it at commit.
 - Later, autovacuum has to clean up the dead row versions.
 
-Unpaced, a job moved about 30,000 deals/s, which is well over 100,000 physical writes a second.
+Unpaced, a job moved about 47,000 deals/s, which is well over 200,000 physical writes a second.
 
 **What I measured.** The setup:
 
@@ -258,20 +258,21 @@ Unpaced, a job moved about 30,000 deals/s, which is well over 100,000 physical w
 - A traffic mix of 60% listing a stage, 20% reading a deal and 20% moving a deal by hand.
 - Rounds that alternate which condition runs first.
 
-Full numbers are in BENCHMARKS.md.
+The numbers below are from the reference run in BENCHMARKS.md:
 
-|                                      | Unpaced job                    | Paced at 10,000 deals/s                          |
-| ------------------------------------ | ------------------------------ | ------------------------------------------------ |
-| Bulk throughput                      | ~23,500 deals/s (50k job ≈ 2s) | ~8,000 deals/s incl. submit and polling (≈ 5–6s) |
-| Users' p99 during jobs (worst round) | 21ms                           | 9ms                                              |
-| Users' p99 just after jobs           | 43–45ms                        | 11–14ms                                          |
-| Users' p99 with no job (baseline)    | 4–6ms                          | 5–6ms                                            |
-| Worst single request                 | 58–124ms                       | 37–112ms                                         |
+|                                      | Unpaced job                   | Paced at 10,000 deals/s      |
+| ------------------------------------ | ----------------------------- | ---------------------------- |
+| A 50k move: worker time / wall-clock | 1.1s / 2.1s (~47,000 deals/s) | 5.3s / 6.3s (~9,400 deals/s) |
+| Users' p99 with no job (baseline)    | 4.1–4.6ms                     | 4.2–4.3ms                    |
+| Users' p99 during jobs               | 6.3–9.0ms, about double       | 3.7–4.5ms, unchanged         |
+| Users' p99 just after jobs           | 6.3–7.0ms                     | 4.1–4.4ms                    |
+| Worst single request during jobs     | 63–83ms                       | 13–36ms                      |
 
 Both workspaces moved together: Small Co, which had no job running, suffered as much as Large
 Co. At 100 requests/s per workspace there was no measurable effect at all. The damage appears only
 once the database has less headroom, and it's in the tail (p99 and the worst requests), not the
-median.
+median. Runs vary: earlier exploratory runs showed unpaced p99 as high as 21ms during jobs and
+45ms after, with paced jobs staying under 10ms.
 
 **The mechanisms, and what each one costs:**
 
@@ -280,7 +281,7 @@ median.
 | 50,000-deal cap per job                                | Bounds one job's size                                                                                        | Doesn't bound its intensity. A broader filter is rejected rather than split automatically           |
 | A separate pool for the worker (2 connections)         | Users never wait for a free connection                                                                       | Isolates connections only. CPU, disk, the write-ahead log, the cache and row locks are still shared |
 | One running job per workspace (a partial unique index) | One tenant never holds more than one worker. With one multi-row writer per workspace, deadlocks can't happen | A tenant's jobs run one after another, with no parallelism inside a tenant                          |
-| Pacing at 10,000 deals/s per job                       | Spreads writes out: p99 impact roughly halved, the after-effect about 3× smaller                             | A 50k job takes about 5s instead of 2s                                                              |
+| Pacing at 10,000 deals/s per job                       | Spreads writes out: users' p99 stays at its no-job level, where unpaced jobs roughly doubled it              | A 50k job takes about 5s of worker time instead of 1s                                               |
 | Batches of 500, and a 2s lock timeout                  | A user editing a deal in a batch waits milliseconds. A job blocked by a user's lock gives way and retries    | More transactions than larger batches would need                                                    |
 
 **Concurrency versus rate.**
@@ -294,8 +295,8 @@ median.
 **Why 10,000 deals/s.** I measured the two ends first:
 
 - Full speed hurt users' tail latency in every workspace.
-- At 10,000/s, p99 during a job stayed within a few milliseconds of normal, and a 50k job still
-  finishes in about five seconds.
+- At 10,000/s, p99 during a job stayed at its no-job level, and a 50k job still finishes in about
+  five seconds.
 
 A lower limit would cut the impact further, at the cost of slower jobs. The limit is one
 environment variable, `WORKER_MAX_DEALS_PER_SECOND`.
@@ -327,8 +328,9 @@ environment variable, `WORKER_MAX_DEALS_PER_SECOND`.
 
 - Every workspace still shares one database. Pacing reduces how much of it a job takes, but it
   can't bring the effect on other workspaces to zero.
-- Even paced, single requests occasionally took 37–112ms during or after a job. That comes from
-  database-wide work such as checkpoints and vacuum, which no per-job limit controls.
+- Even paced, single requests occasionally took 13–36ms during jobs and up to 91ms just after
+  them. That comes from database-wide work such as checkpoints and vacuum, which no per-job limit
+  controls.
 - N workers running N tenants' jobs add up.
 
 Real isolation needs separate databases: shard workspaces across clusters, with the largest

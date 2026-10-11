@@ -1,12 +1,20 @@
-import { randomUUID } from 'node:crypto';
-import { cpus, totalmem } from 'node:os';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { Pool } from 'pg';
 import { loadConfig } from '../config';
-import { STAGES, type Stage } from '../crm/pipeline';
+import { STAGES } from '../crm/pipeline';
 import { createPool } from '../db/pool';
 import { LARGE_WORKSPACE_ID, SEED_WORKSPACES } from '../scripts/seed';
+import {
+  API_URL,
+  BULK_STAGES,
+  bulkCutoff,
+  machineLine,
+  numberFlag,
+  otherStage,
+  submitBulkMove,
+  waitForJob,
+} from './common';
 
 /**
  * How much does a running bulk move slow down interactive requests, in the same workspace and in
@@ -16,16 +24,13 @@ import { LARGE_WORKSPACE_ID, SEED_WORKSPACES } from '../scripts/seed';
  * and latency counts from the scheduled send time. A closed loop (send, wait, send again) slows
  * down whenever the server does, which would hide exactly the stalls being measured.
  *
- *   node dist/bench/isolation.js [--rate 100] [--seconds 20] [--warmup 5]
+ *   node dist/bench/isolation.js [--rate 100] [--seconds 20] [--warmup 5] [--rounds 1]
  *
  * Needs the full seed (make seed-full) plus a running API and worker. It moves deals, so re-seed
  * afterwards.
  */
 
-const API_URL = process.env.API_URL ?? 'http://localhost:3000';
 const SMALL_WORKSPACE_ID = SEED_WORKSPACES[1]?.id ?? '';
-const BULK_STAGES: [Stage, Stage] = ['contract_sent', 'verbal_commit'];
-const JOB_TIMEOUT_MS = 120_000;
 
 interface Group {
   name: string;
@@ -117,44 +122,16 @@ async function openLoop(
  * stages, one job after another. Returns once the last job has finished.
  */
 async function runBulkJobs(pool: Pool, until: number, createdTo: string): Promise<BulkResult> {
-  const headers = { 'x-workspace-id': LARGE_WORKSPACE_ID, 'content-type': 'application/json' };
   const result: BulkResult = { jobs: 0, moved: 0, jobSeconds: [] };
   let target = BULK_STAGES[0];
   while (performance.now() < until) {
     const started = performance.now();
-    const submitted = await fetch(`${API_URL}/bulk-moves`, {
-      method: 'POST',
-      headers: { ...headers, 'idempotency-key': randomUUID() },
-      body: JSON.stringify({ filter: { createdTo }, targetStage: target }),
-    });
-    if (submitted.status !== 202) {
-      throw new Error(`bulk submit failed: HTTP ${submitted.status} ${await submitted.text()}`);
-    }
-    const { id } = (await submitted.json()) as { id: number };
-    // Without a deadline, a run with no live worker would poll forever (it once did).
-    const deadline = performance.now() + JOB_TIMEOUT_MS;
-    let job = { status: 'pending', moved: 0 };
-    while (job.status === 'pending' || job.status === 'running') {
-      if (performance.now() > deadline) {
-        throw new Error(
-          `bulk job ${id} is still ${job.status} after ${JOB_TIMEOUT_MS / 1000}s: is a worker running?`,
-        );
-      }
-      await sleep(100);
-      // Read straight from the database: the API allows one poll per job every 2s, too coarse
-      // to time a job that finishes in a few seconds.
-      const { rows } = await pool.query<{ status: string; moved: number }>(
-        'SELECT status, moved_count AS moved FROM bulk_jobs WHERE id = $1',
-        [id],
-      );
-      job = rows[0] ?? job;
-    }
-    if (job.status !== 'completed') throw new Error(`bulk job ${id} ended as ${job.status}`);
-
+    const { id } = await submitBulkMove(createdTo, target);
+    const job = await waitForJob(pool, id);
     result.jobs += 1;
     result.moved += job.moved;
     result.jobSeconds.push((performance.now() - started) / 1000);
-    target = target === BULK_STAGES[0] ? BULK_STAGES[1] : BULK_STAGES[0];
+    target = otherStage(target);
   }
   return result;
 }
@@ -203,38 +180,17 @@ async function sampleDealIds(pool: Pool, workspaceId: string, count: number): Pr
   return rows.map((row) => row.id);
 }
 
-/** A created_at cut-off that selects just under 50,000 Large Co deals: the bulk filter. */
-async function bulkCutoff(pool: Pool): Promise<string> {
-  const { rows } = await pool.query<{ created_at: Date }>(
-    `SELECT created_at FROM opportunities WHERE workspace_id = $1
-      ORDER BY created_at OFFSET 50000 LIMIT 1`,
-    [LARGE_WORKSPACE_ID],
-  );
-  const cutoff = rows[0]?.created_at;
-  if (!cutoff) throw new Error('Large Co has fewer than 50,000 deals: run `make seed-full` first');
-  return cutoff.toISOString();
-}
-
 function parseArgs(argv: string[]): {
   rate: number;
   seconds: number;
   warmup: number;
   rounds: number;
 } {
-  const value = (flag: string, fallback: number): number => {
-    const index = argv.indexOf(flag);
-    const raw = index >= 0 ? argv[index + 1] : undefined;
-    const parsed = raw === undefined ? fallback : Number(raw);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
-      throw new Error(`${flag} must be a positive number`);
-    }
-    return parsed;
-  };
   return {
-    rate: value('--rate', 100),
-    seconds: value('--seconds', 20),
-    warmup: value('--warmup', 5),
-    rounds: value('--rounds', 1),
+    rate: numberFlag(argv, '--rate', 100),
+    seconds: numberFlag(argv, '--seconds', 20),
+    warmup: numberFlag(argv, '--warmup', 5),
+    rounds: numberFlag(argv, '--rounds', 1),
   };
 }
 
@@ -283,11 +239,8 @@ async function main(): Promise<void> {
       },
     ];
     const createdTo = await bulkCutoff(pool);
-    console.log(
-      `machine: ${cpus().length} CPUs (${cpus()[0]?.model ?? 'unknown'}), ` +
-        `${(totalmem() / 2 ** 30).toFixed(1)} GiB; node ${process.version}`,
-    );
-    console.log(`bulk filter: Large Co deals created before ${createdTo} (just under 50,000)`);
+    console.log(machineLine());
+    console.log(`bulk filter: Large Co deals created before ${createdTo} (50,000 deals)`);
 
     await runPhase('warm-up', groups, warmup, rate);
     // Rounds alternate which condition runs first, so warm-up and drift effects don't all land

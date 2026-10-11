@@ -7,13 +7,12 @@ everything else running. [DESIGN.md](DESIGN.md) has the reasoning.
 **Status:**
 
 - Part 1, the CRM foundation, is done.
-- Part 2, the bulk engine, is in progress. Done:
+- Part 2, the bulk engine, is done:
   - idempotent submission
   - the resumable Postgres worker
   - pacing and fairness between workspaces
   - a rate-limited progress endpoint that tells slow, stuck and failed apart
-
-  Still to come: the benchmarks.
+  - benchmarks ([BENCHMARKS.md](BENCHMARKS.md))
 
 ## Run it
 
@@ -87,6 +86,24 @@ is concentrated where behaviour is subtle:
 Each safety mechanism was checked by removing it: the version check, the lease-epoch fence, the
 idempotency unique constraint, the pool's error handler, pacing, round-robin turns, time slicing
 and the poll limit. Every removal makes its test fail.
+
+## Benchmarks
+
+```bash
+make bench
+```
+
+This runs every benchmark, each from a fresh full seed, in about six minutes, and saves the raw
+output to `bench/results/`:
+
+1. a bulk move of 50,000 deals, paced and unpaced
+2. users' latency in the same and in another workspace while bulk jobs run
+3. a worker killed at 30,000 of 50,000 and resumed, with a correctness proof
+
+[BENCHMARKS.md](BENCHMARKS.md) has the numbers, the hardware and the method. Each benchmark also
+runs on its own: `docker compose run --rm bench node dist/bench/throughput.js`,
+`docker compose run --rm bench node dist/bench/isolation.js --rate 200 --seconds 15 --rounds 2`,
+and `make bench-kill-resume`.
 
 ## API
 
@@ -204,7 +221,7 @@ Compose publishes Postgres on host port 5433 (`PG_PORT`) and the API on 3000 (`A
   - round-robin turns between workspaces
   - time slicing, so a long job hands its worker back while other workspaces wait
 
-**Not yet:** `BENCHMARKS.md`.
+**Measured:** [BENCHMARKS.md](BENCHMARKS.md), reproducible with `make bench`.
 
 **Deliberately not built:** rules on the transition sequence. Any stage can move to any other,
 including backwards and reopening closed deals; see DESIGN.md, assumption 2.

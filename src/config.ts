@@ -39,8 +39,9 @@ export interface WorkerConfig {
   lockTimeoutMs: number;
   /**
    * Speed limit for one job, in deals per second; 0 means unlimited. At most one job runs per
-   * workspace, so this is also the per-workspace limit. Unpaced, a job wrote about 30,000 deals/s
-   * and pushed other workspaces' worst-case latency from ~10ms to 70-150ms.
+   * workspace, so this is also the per-workspace limit. Unpaced, a job moves about 47,000 deals/s
+   * and roughly doubles other workspaces' p99 latency; paced, their p99 is unchanged
+   * (BENCHMARKS.md).
    */
   maxDealsPerSecond: number;
   /**
