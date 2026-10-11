@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { Pool, types } from 'pg';
 import type { DatabaseConfig } from '../config';
 
@@ -24,7 +25,7 @@ export function createPool(
   applicationName: string,
   options: PoolOptions = {},
 ): Pool {
-  return new Pool({
+  const pool = new Pool({
     connectionString: config.url,
     max: config.poolMax,
     // Shows up in pg_stat_activity, so API, worker and script connections can be told apart.
@@ -34,4 +35,13 @@ export function createPool(
       ? { idle_in_transaction_session_timeout: options.idleInTransactionTimeoutMs }
       : {}),
   });
+  // An idle connection can be closed underneath us: Postgres restarting, a network blip, an admin
+  // ending sessions. pg reports that as an 'error' event on the pool, and with no listener Node
+  // crashes the whole process. That once took the worker down; see docs/challenges.md. The pool
+  // already discards the broken connection and opens a fresh one for the next query, so logging
+  // is all that's needed here.
+  pool.on('error', (err) => {
+    Logger.warn(`${applicationName}: idle database connection lost (${err.message})`, 'Database');
+  });
+  return pool;
 }

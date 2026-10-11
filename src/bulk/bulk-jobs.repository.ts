@@ -2,6 +2,7 @@ import type { Stage } from '../crm/pipeline';
 import { oneRow, type Queryable } from '../db/queryable';
 import type { JobItemOutcome } from './dto';
 import type { BulkFilter } from './filter';
+import type { ProgressRow } from './progress';
 
 export type BulkJobStatus = 'pending' | 'running' | 'completed' | 'failed';
 
@@ -153,6 +154,39 @@ export async function finalizeJob(tx: Queryable, id: number, total: number): Pro
     [id, total],
   );
   return oneRow(rows);
+}
+
+/**
+ * The job row plus the timings progress health needs. Every duration is computed by Postgres
+ * against its own now(), the clock that wrote the timestamps, so API and database clocks can't
+ * disagree.
+ */
+export async function findProgressRow(
+  db: Queryable,
+  workspaceId: string,
+  id: number,
+): Promise<ProgressRow | undefined> {
+  const { rows } = await db.query<ProgressRow>(
+    `SELECT j.id, j.status, j.total, j.cursor_seq AS processed, j.moved_count AS moved,
+            j.skipped_count AS skipped, j.attempts, j.last_error AS "lastError",
+            j.lease_owner AS "leaseOwner", j.last_progress_at AS "lastProgressAt",
+            extract(epoch FROM now() - j.last_progress_at)::float8 AS "secondsSinceProgress",
+            extract(epoch FROM j.lease_expires_at - now())::float8 AS "leaseSecondsLeft",
+            extract(epoch FROM now() - coalesce(j.started_at, j.created_at))::float8
+              AS "secondsSinceStart",
+            extract(epoch FROM now() - j.created_at)::float8 AS "secondsSinceCreated",
+            j.started_at IS NOT NULL AS started,
+            (SELECT r.id FROM bulk_jobs r
+              WHERE r.workspace_id = j.workspace_id AND r.status = 'running' AND r.id <> j.id
+              LIMIT 1) AS "blockingJobId",
+            EXISTS (SELECT 1 FROM bulk_jobs w
+                     WHERE w.status = 'running' AND w.lease_owner IS NOT NULL
+                       AND w.lease_expires_at > now()) AS "anyWorkerActive"
+       FROM bulk_jobs j
+      WHERE j.id = $1 AND j.workspace_id = $2`,
+    [id, workspaceId],
+  );
+  return rows[0];
 }
 
 export async function listJobItems(

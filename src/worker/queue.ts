@@ -36,22 +36,34 @@ export interface BatchFaults {
   afterApply?: () => Promise<void>;
 }
 
-// The next job to run: a pending job whose workspace has none running, or a running job whose
-// lease has lapsed (its worker died, failed, or handed it back). SKIP LOCKED means workers asking
-// at the same moment take different jobs, and a job whose batch is mid-transaction can't be
-// claimed. An expired lease that still names an owner was never handed back: that worker died,
-// which counts as a failed attempt.
+// A job a worker may take (alias j): pending in a workspace with nothing running, or running
+// with a lapsed lease (its worker died, failed, or handed it back). Shared by claiming and by the
+// "is anyone waiting?" check, so the two can never disagree.
+const CLAIMABLE = `
+  ((j.status = 'pending'
+    AND NOT EXISTS (SELECT 1 FROM bulk_jobs r
+                     WHERE r.workspace_id = j.workspace_id AND r.status = 'running'))
+   OR (j.status = 'running' AND j.lease_expires_at < now()))`;
+
+// The next job to run, chosen fairly. The candidate is the job of the workspace whose turn came
+// longest ago (never served goes first), oldest job within it. That workspace's turn is recorded
+// in the same statement. SKIP LOCKED means workers asking at the same moment take different jobs,
+// and a job whose batch is mid-transaction can't be claimed. An expired lease that still names an
+// owner was never handed back: that worker died, which counts as a failed attempt.
 const CLAIM_NEXT_JOB = `
   WITH candidate AS (
-    SELECT j.id
+    SELECT j.id, j.workspace_id
       FROM bulk_jobs j
-     WHERE (j.status = 'pending'
-            AND NOT EXISTS (SELECT 1 FROM bulk_jobs r
-                             WHERE r.workspace_id = j.workspace_id AND r.status = 'running'))
-        OR (j.status = 'running' AND j.lease_expires_at < now())
-     ORDER BY j.id
+      LEFT JOIN bulk_workspace_turns t ON t.workspace_id = j.workspace_id
+     WHERE ${CLAIMABLE}
+     ORDER BY t.last_served_at ASC NULLS FIRST, j.id
      LIMIT 1
-       FOR UPDATE SKIP LOCKED
+       FOR UPDATE OF j SKIP LOCKED
+  ),
+  turn AS (
+    INSERT INTO bulk_workspace_turns (workspace_id, last_served_at)
+    SELECT workspace_id, now() FROM candidate
+    ON CONFLICT (workspace_id) DO UPDATE SET last_served_at = excluded.last_served_at
   )
   UPDATE bulk_jobs j
      SET status = 'running',
@@ -86,18 +98,33 @@ export async function claimNextJob(
   }
 }
 
+/** Whether a job of some other workspace is waiting for a worker: the trigger for a time slice. */
+export async function hasWaitingJobs(pool: Pool, exceptWorkspaceId: string): Promise<boolean> {
+  const { rows } = await pool.query<{ waiting: boolean }>(
+    `SELECT EXISTS (SELECT 1 FROM bulk_jobs j WHERE j.workspace_id <> $1 AND ${CLAIMABLE}) AS waiting`,
+    [exceptWorkspaceId],
+  );
+  return rows[0]?.waiting ?? false;
+}
+
 // One batch, in one statement. The version check in `moved` is the "person wins" rule: a deal
 // changed since the click no longer has its snapshot version, so it isn't moved. If a person's
 // move holds the row lock, this statement waits, then re-checks the condition against the row
 // the person committed, and skips it. The snapshot's from_stage is exact, because an unchanged
 // version means an unchanged stage.
+//
+// Every step is written so its cost stays proportional to the batch, whatever the planner
+// believes about the job's size. The batch is the seq range ($4, $4 + $5]: seqs are contiguous
+// from 1. A newly created job isn't in the table's statistics yet, and an earlier version that
+// joined the items table to the batch was planned as a scan of the whole job per batch, 2.6s
+// instead of milliseconds (docs/challenges.md).
 const APPLY_BATCH = `
   WITH batch AS (
     SELECT seq, opportunity_id, expected_version, from_stage
       FROM bulk_job_items
-     WHERE job_id = $1 AND seq > $4
+     WHERE job_id = $1 AND seq > $4::int AND seq <= $4::int + $5::int
      ORDER BY seq
-     LIMIT $5
+     LIMIT $5::int
   ),
   moved AS (
     UPDATE opportunities o
@@ -114,16 +141,15 @@ const APPLY_BATCH = `
     SELECT $2, m.id, m.from_stage, $3, 'bulk', $1, clock_timestamp()
       FROM moved m
   ),
+  -- Bounded by the batch's own seq range, with "was it moved?" answered by a hashed IN, so it
+  -- touches at most one batch of items.
   outcomes AS (
     UPDATE bulk_job_items i
-       SET outcome = CASE WHEN m.seq IS NULL THEN 'skipped_conflict' ELSE 'moved' END
-      FROM batch b
-      LEFT JOIN moved m ON m.seq = b.seq
-     WHERE i.job_id = $1 AND i.seq = b.seq
+       SET outcome = CASE WHEN i.seq IN (SELECT m.seq FROM moved m)
+                          THEN 'moved' ELSE 'skipped_conflict' END
+     WHERE i.job_id = $1 AND i.seq > $4::int AND i.seq <= $4::int + $5::int
   )
-  SELECT count(*)::int AS size, count(m.seq)::int AS moved
-    FROM batch b
-    LEFT JOIN moved m ON m.seq = b.seq`;
+  SELECT (SELECT count(*) FROM batch)::int AS size, (SELECT count(*) FROM moved)::int AS moved`;
 
 // The checkpoint: the cursor and counters move in the same transaction as the deals, so they
 // can't disagree. A crash before the commit undoes the whole batch; after it, the batch is done

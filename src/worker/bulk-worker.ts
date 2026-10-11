@@ -4,6 +4,7 @@ import type { WorkerConfig } from '../config';
 import {
   claimNextJob,
   failJob,
+  hasWaitingJobs,
   recordFailure,
   releaseLease,
   runBatch,
@@ -45,7 +46,7 @@ export class BulkWorker {
     while (!this.stopping) {
       const job = await this.claim();
       if (job) await this.process(job);
-      else await this.idle();
+      else await this.sleep(this.settings.pollMs);
     }
     this.logger.log(`worker ${this.settings.id} stopped`);
   }
@@ -84,6 +85,7 @@ export class BulkWorker {
         return;
       }
 
+      const batchStartedAt = Date.now();
       let outcome: BatchOutcome;
       try {
         outcome = await runBatch(this.pool, job, this.settings, this.options.faults);
@@ -121,12 +123,51 @@ export class BulkWorker {
       if (batches % LOG_EVERY_BATCHES === 0) {
         this.logger.log(`job ${job.id}: ${progress.processed}/${progress.total}`);
       }
+      if (await this.sliceUsedUp(job, startedAt)) {
+        await releaseLease(this.pool, job);
+        this.logger.log(
+          `job ${job.id}: time slice used up and other workspaces are waiting; handed back at ` +
+            `${progress.processed}/${progress.total}`,
+        );
+        return;
+      }
+      await this.pace(batchStartedAt);
     }
   }
 
-  private idle(): Promise<void> {
+  /**
+   * Fairness between workspaces. A worker keeps a job for at most one slice while another
+   * workspace's job is waiting. Then it hands the job back: the job resumes later from its cursor,
+   * and the round-robin claim gives the waiting workspace its turn. Alone, a job runs to the end.
+   */
+  private async sliceUsedUp(job: ClaimedJob, startedAt: number): Promise<boolean> {
+    const { sliceMs } = this.settings;
+    if (sliceMs <= 0 || Date.now() - startedAt < sliceMs) return false;
+    try {
+      return await hasWaitingJobs(this.pool, job.workspaceId);
+    } catch (err) {
+      // If the check fails, keep going: fairness is an optimisation, finishing the job is not.
+      this.logger.warn(`job ${job.id}: could not check for waiting jobs: ${describe(err)}`);
+      return false;
+    }
+  }
+
+  /**
+   * Holds the job to its speed limit: a batch of N deals takes at least N / limit seconds, and
+   * the worker sleeps away whatever the batch itself didn't use. Spacing batches out keeps the
+   * database's write bursts small, which is where other workspaces' latency spikes came from.
+   */
+  private async pace(batchStartedAt: number): Promise<void> {
+    const { batchSize, maxDealsPerSecond } = this.settings;
+    if (maxDealsPerSecond <= 0) return;
+    const remaining = (batchSize / maxDealsPerSecond) * 1000 - (Date.now() - batchStartedAt);
+    if (remaining > 0) await this.sleep(remaining);
+  }
+
+  /** A sleep that stop() cuts short, so shutdown never waits out a poll interval or a pace. */
+  private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => {
-      const timer = setTimeout(resolve, this.settings.pollMs);
+      const timer = setTimeout(resolve, ms);
       this.wakeUp = () => {
         clearTimeout(timer);
         resolve();

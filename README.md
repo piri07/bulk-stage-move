@@ -7,9 +7,9 @@ everything else running. [DESIGN.md](DESIGN.md) has the reasoning.
 **Status:**
 
 - Part 1, the CRM foundation, is done.
-- Part 2, the bulk engine, is in progress. Idempotent submission and the resumable Postgres worker
-  are done. Still to come: progress health (slow, stuck or failed), isolation (pacing and
-  fairness) and the benchmarks.
+- Part 2, the bulk engine, is in progress. Done: idempotent submission, the resumable Postgres
+  worker, pacing and fairness between workspaces. Still to come: progress health (slow, stuck or
+  failed) and the benchmarks.
 
 ## Run it
 
@@ -74,9 +74,13 @@ is concentrated where behaviour is subtle:
   including when that move commits while a batch waits for the row; resuming after a crash
   mid-batch; refusing writes from a replaced worker; one running job per workspace; retries,
   graceful handover and giving up
+- isolation: the speed limit, round-robin turns between workspaces, and a long job handed back
+  after its time slice so another workspace's job runs
+- the database pool surviving Postgres closing its connections
 
-Each of the bulk safety mechanisms was checked by removing it: the version check, the lease-epoch
-fence, and the idempotency unique constraint. Every removal makes its test fail.
+Each safety mechanism was checked by removing it: the version check, the lease-epoch fence, the
+idempotency unique constraint, the pool's error handler, pacing, round-robin turns and time
+slicing. Every removal makes its test fail.
 
 ## API
 
@@ -125,21 +129,23 @@ curl -s "localhost:3000/bulk-moves/$JOB/items?outcome=skipped_conflict" -H "x-wo
 
 ## Configuration
 
-| Variable                  | Default                                      | Notes                                        |
-| ------------------------- | -------------------------------------------- | -------------------------------------------- |
-| `PORT`                    | `3000`                                       |                                              |
-| `DATABASE_URL`            | `postgres://crm:crm@localhost:5433/crm`      |                                              |
-| `DB_POOL_MAX`             | `10`                                         |                                              |
-| `DB_STATEMENT_TIMEOUT_MS` | `5000`                                       | `0` disables it                              |
-| `TEST_DATABASE_URL`       | `postgres://crm:crm@localhost:5433/crm_test` | must end in `_test`: it is dropped every run |
-| `BULK_MAX_DEALS`          | `50000`                                      | the most deals one bulk move may cover       |
-| `WORKER_BATCH_SIZE`       | `500`                                        | deals per batch (one transaction)            |
-| `WORKER_LEASE_MS`         | `15000`                                      | how soon a dead worker's job is taken over   |
-| `WORKER_POLL_MS`          | `1000`                                       | how often an idle worker looks for a job     |
-| `WORKER_MAX_ATTEMPTS`     | `5`                                          | failed runs before a job is marked failed    |
-| `WORKER_RETRY_BACKOFF_MS` | `2000`                                       | first retry delay; doubles each failure      |
-| `WORKER_LOCK_TIMEOUT_MS`  | `2000`                                       | how long a batch waits for a row lock        |
-| `WORKER_ID`               | `hostname:pid`                               | shown as the job's lease owner               |
+| Variable                      | Default                                      | Notes                                                     |
+| ----------------------------- | -------------------------------------------- | --------------------------------------------------------- |
+| `PORT`                        | `3000`                                       |                                                           |
+| `DATABASE_URL`                | `postgres://crm:crm@localhost:5433/crm`      |                                                           |
+| `DB_POOL_MAX`                 | `10`                                         |                                                           |
+| `DB_STATEMENT_TIMEOUT_MS`     | `5000`                                       | `0` disables it                                           |
+| `TEST_DATABASE_URL`           | `postgres://crm:crm@localhost:5433/crm_test` | must end in `_test`: it is dropped every run              |
+| `BULK_MAX_DEALS`              | `50000`                                      | the most deals one bulk move may cover                    |
+| `WORKER_BATCH_SIZE`           | `500`                                        | deals per batch (one transaction)                         |
+| `WORKER_LEASE_MS`             | `15000`                                      | how soon a dead worker's job is taken over                |
+| `WORKER_POLL_MS`              | `1000`                                       | how often an idle worker looks for a job                  |
+| `WORKER_MAX_ATTEMPTS`         | `5`                                          | failed runs before a job is marked failed                 |
+| `WORKER_RETRY_BACKOFF_MS`     | `2000`                                       | first retry delay; doubles each failure                   |
+| `WORKER_LOCK_TIMEOUT_MS`      | `2000`                                       | how long a batch waits for a row lock                     |
+| `WORKER_MAX_DEALS_PER_SECOND` | `10000`                                      | speed limit per job (and so per workspace); `0` = unpaced |
+| `WORKER_SLICE_MS`             | `5000`                                       | time slice while other workspaces wait; `0` = no slicing  |
+| `WORKER_ID`                   | `hostname:pid`                               | shown as the job's lease owner                            |
 
 Compose publishes Postgres on host port 5433 (`PG_PORT`) and the API on 3000 (`API_PORT`).
 
@@ -166,11 +172,15 @@ Compose publishes Postgres on host port 5433 (`PG_PORT`) and the API on 3000 (`A
 - one running job per workspace
 - retries with backoff, graceful handover on `SIGTERM`, and giving up after repeated failures
 - a job's status and its per-deal outcomes, readable through the API
+- isolation:
+  - a separate connection pool for the worker
+  - pacing at 10,000 deals/s per job (and so per workspace)
+  - round-robin turns between workspaces
+  - time slicing, so a long job hands its worker back while other workspaces wait
 
 **Not yet:**
 
 - progress health that tells slow, stuck and failed apart
-- isolation: pacing and cross-workspace fairness
 - `BENCHMARKS.md`
 
 **Deliberately not built:** rules on the transition sequence. Any stage can move to any other,
@@ -188,8 +198,10 @@ src/worker/     the worker process: claiming, leases, batches and checkpoints
 src/common/     workspace guard, id pipe, pagination
 src/db/         pool, migration runner, transaction helper, pg error helpers
 src/scripts/    seed
+src/bench/      load generator: interactive latency with and without bulk jobs
 migrations/     plain SQL, applied in filename order
 test/           end-to-end tests against Postgres
+docs/           challenges.md: problems hit while building this, and how each was solved
 ```
 
 The stack is NestJS 11 on Node 22 with TypeScript 6.0, and PostgreSQL 17 is the only datastore.

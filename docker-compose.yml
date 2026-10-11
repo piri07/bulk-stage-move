@@ -57,9 +57,25 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  # Benchmarks run inside the compose network, so host port forwarding doesn't add noise.
+  # Not started by `up`; run with `docker compose run --rm bench`.
+  bench:
+    <<: *app
+    profiles: ['bench']
+    command: ['node', 'dist/bench/isolation.js']
+    environment:
+      DATABASE_URL: postgres://crm:crm@postgres:5432/crm
+      API_URL: http://api:3000
+
   worker:
     <<: *app
     command: ['node', 'dist/worker/main.js']
+    environment:
+      DATABASE_URL: postgres://crm:crm@postgres:5432/crm
+      # Deals per second per job; 0 disables pacing. Override from the shell to compare.
+      WORKER_MAX_DEALS_PER_SECOND: ${WORKER_MAX_DEALS_PER_SECOND:-10000}
+      # How long a job keeps its worker while other workspaces wait; 0 disables time slicing.
+      WORKER_SLICE_MS: ${WORKER_SLICE_MS:-5000}
     # On `docker compose stop` the worker finishes its batch in flight and hands its job back.
     stop_grace_period: 30s
     depends_on:

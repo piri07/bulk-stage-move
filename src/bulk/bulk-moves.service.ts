@@ -14,6 +14,7 @@ import {
   finalizeJob,
   findJob,
   findJobByKey,
+  findProgressRow,
   insertJob,
   listJobItems,
   snapshotDeals,
@@ -22,6 +23,10 @@ import {
 } from './bulk-jobs.repository';
 import type { ListJobItemsQuery, SubmitBulkMoveDto } from './dto';
 import { hashRequest, normalizeFilter } from './filter';
+import { describeProgress, type JobProgress, type ProgressSettings } from './progress';
+
+// A held job normally commits a batch about every 50ms, so 2s without one is 40 times late.
+const SLOW_AFTER_SECONDS = 2;
 
 export interface SubmitResult {
   job: BulkJob;
@@ -32,12 +37,20 @@ export interface SubmitResult {
 @Injectable()
 export class BulkMovesService {
   private readonly maxDeals: number;
+  private readonly progressSettings: ProgressSettings;
 
   constructor(
     @Inject(PG_POOL) private readonly pool: Pool,
     @Inject(APP_CONFIG) config: AppConfig,
   ) {
     this.maxDeals = config.bulk.maxDeals;
+    this.progressSettings = {
+      slowAfterSeconds: SLOW_AFTER_SECONDS,
+      // Two lease lengths: by then a live worker would have taken a stalled job over.
+      stuckAfterSeconds: (2 * config.worker.leaseMs) / 1000,
+      maxAttempts: config.worker.maxAttempts,
+      pollIntervalMs: config.bulk.pollIntervalMs,
+    };
   }
 
   /**
@@ -91,6 +104,12 @@ export class BulkMovesService {
     const job = await findJob(this.pool, workspaceId, id);
     if (!job) throw new NotFoundException('bulk move not found');
     return job;
+  }
+
+  async progress(workspaceId: string, id: number): Promise<JobProgress> {
+    const row = await findProgressRow(this.pool, workspaceId, id);
+    if (!row) throw new NotFoundException('bulk move not found');
+    return describeProgress(row, this.progressSettings);
   }
 
   async listItems(

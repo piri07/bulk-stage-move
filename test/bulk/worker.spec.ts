@@ -280,6 +280,31 @@ describe('bulk worker', () => {
     expect((await claim()).id).toBe(secondInBusy);
   });
 
+  describe('fairness between workspaces', () => {
+    // Oldest-job-first would run A's whole backlog before B's single job: a1, a2, b1.
+    it('gives the next turn to the workspace served least recently', async () => {
+      const [a, b] = await Promise.all([createWorkspace(pool), createWorkspace(pool)]);
+      await insertDeals(pool, a, 3, { stage: 'qualified' });
+      await insertDeals(pool, a, 3, { stage: 'contacted' });
+      await insertDeals(pool, b, 3);
+      const a1 = await submitJob(a);
+      const a2 = await submitJob(a, {
+        filter: { stages: ['contacted'] },
+        targetStage: 'negotiation',
+      });
+      const b1 = await submitJob(b);
+
+      const order: number[] = [];
+      for (let turn = 0; turn < 3; turn += 1) {
+        const job = await claim();
+        order.push(job.id);
+        await drain(job);
+      }
+
+      expect(order).toEqual([a1, b1, a2]);
+    });
+  });
+
   describe('the worker loop', () => {
     const settings = (overrides: Partial<WorkerConfig> = {}): WorkerConfig => ({
       ...loadConfig().worker,
@@ -367,6 +392,53 @@ describe('bulk worker', () => {
 
       expect(await jobRow(jobId)).toMatchObject({ cursor_seq: 0, lease_owner: null });
       expect((await jobRow(jobId)).last_error).toMatch(/gave up after 2 failed attempts/);
+    });
+
+    // With one worker and no slicing, A's long job would hold the worker to the end while B's job
+    // waited. With slicing, A is handed back after its slice, B gets its turn, and A resumes.
+    it("hands a long job back after its time slice so another workspace's job runs", async () => {
+      const [a, b] = await Promise.all([createWorkspace(pool), createWorkspace(pool)]);
+      await insertDeals(pool, a, 9);
+      await insertDeals(pool, b, 3);
+      const long = await submitJob(a);
+      const short = await submitJob(b);
+      const worker = new BulkWorker(pool, settings({ sliceMs: 1 }), { logger: SILENT });
+
+      await runUntil(worker, async () => {
+        const { rows } = await pool.query<{ done: number }>(
+          `SELECT count(*) AS done FROM bulk_jobs WHERE id = ANY($1) AND status = 'completed'`,
+          [[long, short]],
+        );
+        return rows[0]?.done === 2;
+      });
+
+      const { rows } = await pool.query<{ id: number }>(
+        'SELECT id FROM bulk_jobs WHERE id = ANY($1) ORDER BY finished_at',
+        [[long, short]],
+      );
+      expect(rows.map((row) => row.id)).toEqual([short, long]);
+      // Handed back and claimed again, and the hand-back didn't count as a failure.
+      expect(await jobRow(long)).toMatchObject({ moved_count: 9, attempts: 0 });
+      expect((await jobRow(long)).lease_epoch).toBeGreaterThanOrEqual(2);
+    });
+
+    // The speed limit is a lower bound on how long a job takes. 30 deals at 100 deals/s, in
+    // batches of 3, means at least 9 paced gaps of ~30ms (the last batch isn't followed by one).
+    // Unpaced, the same job finishes in a few milliseconds. Only the lower bound is asserted, so a
+    // slow machine can't make this flaky.
+    it('holds a job to its speed limit', async () => {
+      const ws = await createWorkspace(pool);
+      await insertDeals(pool, ws, 30);
+      const jobId = await submitJob(ws);
+      const worker = new BulkWorker(pool, settings({ maxDealsPerSecond: 100 }), {
+        logger: SILENT,
+      });
+
+      const startedAt = Date.now();
+      await runUntil(worker, async () => (await jobRow(jobId)).status === 'completed');
+
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(240);
+      expect(await jobRow(jobId)).toMatchObject({ moved_count: 30 });
     });
   });
 });

@@ -183,6 +183,153 @@ Bulk stage moves are the opposite: few, heavy jobs whose progress is database da
 scale the queue isn't what breaks first. If dispatching ever did become a bottleneck, a broker
 could carry the "work on job X" signal while the job's state stays in Postgres.
 
+### Isolation: polite to everything else
+
+The brief: a bulk move must not starve interactive requests in its own workspace, and must not
+affect other workspaces at all. Every workspace shares one Postgres, so the real question is how
+much of that database one job may take.
+
+**Why the rate matters, even though a move is "just one column".** The application does almost
+nothing per deal, but Postgres does a lot:
+
+- It writes a new version of the deal row, since it never updates a row in place.
+- It adds new entries to every index on `opportunities`. `stage` is indexed, so the update can't
+  take Postgres's cheap in-place (HOT) path.
+- It inserts a history row, with its own index entries.
+- It updates the item's outcome.
+- It writes all of the above to the write-ahead log and flushes it at commit.
+- Later, autovacuum has to clean up the dead row versions.
+
+Unpaced, a job moved about 30,000 deals/s, which is well over 100,000 physical writes a second.
+
+**What I measured.** The setup:
+
+- An open-loop load generator at 200 requests/s per workspace.
+- A traffic mix of 60% listing a stage, 20% reading a deal and 20% moving a deal by hand.
+- Rounds that alternate which condition runs first.
+
+Full numbers are in BENCHMARKS.md.
+
+|                                      | Unpaced job                    | Paced at 10,000 deals/s                          |
+| ------------------------------------ | ------------------------------ | ------------------------------------------------ |
+| Bulk throughput                      | ~23,500 deals/s (50k job ≈ 2s) | ~8,000 deals/s incl. submit and polling (≈ 5–6s) |
+| Users' p99 during jobs (worst round) | 21ms                           | 9ms                                              |
+| Users' p99 just after jobs           | 43–45ms                        | 11–14ms                                          |
+| Users' p99 with no job (baseline)    | 4–6ms                          | 5–6ms                                            |
+| Worst single request                 | 58–124ms                       | 37–112ms                                         |
+
+Both workspaces moved together: Small Co, which had no job running, suffered as much as Large
+Co. At 100 requests/s per workspace there was no measurable effect at all. The damage appears only
+once the database has less headroom, and it's in the tail (p99 and the worst requests), not the
+median.
+
+**The mechanisms, and what each one costs:**
+
+| Mechanism                                              | What it protects                                                                                             | Trade-off                                                                                           |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| 50,000-deal cap per job                                | Bounds one job's size                                                                                        | Doesn't bound its intensity. A broader filter is rejected rather than split automatically           |
+| A separate pool for the worker (2 connections)         | Users never wait for a free connection                                                                       | Isolates connections only. CPU, disk, the write-ahead log, the cache and row locks are still shared |
+| One running job per workspace (a partial unique index) | One tenant never holds more than one worker. With one multi-row writer per workspace, deadlocks can't happen | A tenant's jobs run one after another, with no parallelism inside a tenant                          |
+| Pacing at 10,000 deals/s per job                       | Spreads writes out: p99 impact roughly halved, the after-effect about 3× smaller                             | A 50k job takes about 5s instead of 2s                                                              |
+| Batches of 500, and a 2s lock timeout                  | A user editing a deal in a batch waits milliseconds. A job blocked by a user's lock gives way and retries    | More transactions than larger batches would need                                                    |
+
+**Concurrency versus rate.**
+
+- Limiting how many jobs run at once barely helps on its own: a single unpaced job saturated the
+  database's write path by itself.
+- The rate is the lever that matters.
+- Concurrency (one job per workspace, a fixed number of workers) only bounds the total, to at most
+  workers × 10,000 deals/s.
+
+**Why 10,000 deals/s.** I measured the two ends first:
+
+- Full speed hurt users' tail latency in every workspace.
+- At 10,000/s, p99 during a job stayed within a few milliseconds of normal, and a 50k job still
+  finishes in about five seconds.
+
+A lower limit would cut the impact further, at the cost of slower jobs. The limit is one
+environment variable, `WORKER_MAX_DEALS_PER_SECOND`.
+
+**Considered and not built:**
+
+- **Adaptive slow-down.** Back off when the database gets slower, whoever's load is causing it.
+  Jobs would then run faster when the database is quiet and slower when it's busy, instead of at a
+  fixed rate. Today's limit is a timer, not a measurement: a 500-deal batch is allowed one 50ms
+  window, and the worker sleeps whatever the batch didn't use. The adaptive version would work like
+  TCP congestion control:
+  1. Measure each batch's duration, smoothed over the last few batches.
+  2. Halve the current speed when a batch runs slower than a target (say 50ms against a normal
+     15ms), down to a floor.
+  3. Raise it a little after every healthy batch, up to the 10,000/s ceiling.
+
+  The current speed would be saved on the job row inside the checkpoint that already runs for
+  every batch, so it costs no extra query. A resumed or handed-back job would then keep the speed
+  it had learned, and the progress endpoint could report "throttled to 3,000/s because the database
+  is busy". Its limits: batch time is a noisy proxy for users' latency, and checkpoint and vacuum
+  spikes arrive after the writes that cause them, so it would shorten them rather than prevent
+  them. A fixed limit is simpler to reason about and to measure, so adaptive pacing is on the "next
+  week" list.
+
+- **A global rate limit across all workers.** An exact total budget would need coordination
+  between workers, such as a shared token bucket. The number of workers bounds the total instead.
+
+**The hole it still leaves.**
+
+- Every workspace still shares one database. Pacing reduces how much of it a job takes, but it
+  can't bring the effect on other workspaces to zero.
+- Even paced, single requests occasionally took 37–112ms during or after a job. That comes from
+  database-wide work such as checkpoints and vacuum, which no per-job limit controls.
+- N workers running N tenants' jobs add up.
+
+Real isolation needs separate databases: shard workspaces across clusters, with the largest
+tenants on shards of their own (see Scaling).
+
+### Fairness between workspaces
+
+Pacing decides how hard a job hits the database. Fairness decides which tenant gets a worker next.
+
+- **Already fair:** one running job per workspace means a tenant never holds more than one
+  worker. With several workers, several tenants always progress side by side.
+- **The gap:** when every worker was busy, the next job was simply the oldest one. Take one
+  worker, where A queues ten jobs and then B queues one. B waited behind A's entire backlog,
+  because A's queued jobs are always older.
+
+Two mechanisms close the gap, and they only work together:
+
+1. **Round-robin turns.** `bulk_workspace_turns` records when each workspace last got a worker. A
+   free worker takes the next job from the workspace whose turn came longest ago (never served
+   goes first), oldest job first within that workspace. The turn is recorded in the same
+   statement as the claim. One worker now runs A1, B1, A2, … instead of A1, A2, … A10, B1.
+2. **Time slicing.** After `WORKER_SLICE_MS` (5s), if another workspace's job is waiting, a worker
+   hands its job back. The job resumes later from its cursor, and the hand-back doesn't count as a
+   failure. A job running alone is never interrupted.
+
+Why both are needed:
+
+- **Without round-robin, slicing achieves nothing.** The handed-back job is still the oldest, so
+  it is claimed straight back. Removing round-robin made the slicing test fail too.
+- **Without slicing, round-robin acts only when a job ends**, so one long job still holds its
+  worker.
+
+A live check, with one worker and a 1s slice:
+
+1. A Large Co job of 50,000 deals was handed back at 9,500.
+2. A 179-deal Small Co job ran within about a second, instead of waiting the ~5 seconds the
+   Large Co job needed.
+3. Large Co then resumed and finished, with every deal moved once.
+
+Trade-offs:
+
+- **Slice length.** A shorter slice is fairer, but means more hand-backs and claims. At 5s the
+  overhead is negligible, and no tenant waits behind any one job for more than one slice plus a
+  batch.
+- **Turns are counted, not timed.** Each claim is one turn, however long it runs. A workspace
+  whose turns are 5-second slices and one whose jobs finish in 0.1s get the same number of turns,
+  not the same worker time. The slice caps the imbalance per round. Weighted fair queuing would
+  account for time used, which isn't worth its complexity at this scale.
+- **A handed-back job may continue on another worker.** That's harmless: every batch is fenced by
+  the lease epoch and resumes from the committed cursor.
+
 ### Scaling
 
 One rule decides the architecture at every size: a job's progress must be committed together
