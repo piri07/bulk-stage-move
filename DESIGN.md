@@ -1,534 +1,248 @@
 # Design
 
-This document grows with the code. The bulk stage move is the point of the exercise: its decisions
-are recorded below as they are made, and its mechanics (chunking, the cursor, idempotency,
-isolation) follow as they are built. The CRM foundation it builds on comes last.
+This answers the brief's seven questions, in its order. The reasoning behind each choice and the
+alternatives considered are in [docs/decisions.md](docs/decisions.md), along with the CRM
+foundation. The measurements are in [BENCHMARKS.md](BENCHMARKS.md).
+
+## How it works
+
+```
+POST /bulk-moves     one transaction: job + idempotency key + list of matching deals → 202 {id}
+worker process       claims the job (15s lease), then batches of 500, one transaction each:
+                       fence → move deals, write history, record outcomes → advance cursor
+                     paced at 10,000 deals/s; hands the job back after 5s if another workspace waits
+GET …/:id/progress   reads the job row: counts, health, rate, ETA
+```
+
+Postgres is the only datastore, and the `bulk_jobs` table is the queue. A job's progress has to
+commit in the same transaction as the moves it records, which only the database holding the deals
+can do. A Redis queue such as BullMQ would redeliver a 50,000-deal job whole after a crash, and
+would still need its duplicate protection in Postgres.
 
 ## Assumptions
 
-1. **One pipeline, shared by every workspace.** The brief gives each workspace its own ordered
-   stages; I fixed a single 12-stage pipeline instead (the 500k seed needs 12 stages).
-   - Stages are defined once in `src/crm/pipeline.ts` and mirrored by the Postgres enum
-     `opportunity_stage`. A test fails if the two drift apart.
-   - Per-workspace pipelines would need a `stages(workspace_id, id, position)` table, with a
-     composite foreign key `(workspace_id, stage_id)` replacing the enum.
-   - The bulk engine only ever writes a stage value, so it would not change.
-2. **No rules on the transition sequence: any stage can move to any other.**
-   - Forward moves, backward moves and skipped stages are all allowed (`new_lead → negotiation`,
-     `proposal_sent → contacted`), and so is reopening a closed deal (`closed_won → new_lead`).
-   - The only special case is moving a deal to the stage it is already in, which is a no-op.
-   - This is deliberate. The brief defines no sequence, and real pipelines are often worked out
-     of order.
-   - The bulk engine applies moves in set-based SQL, so every rule would also need a SQL version
-     of the TypeScript check. With no rules, there is nothing to keep in sync.
-   - To add rules later, define the allowed `(from, to)` pairs once, for example in an
-     `allowed_transitions` table. The single move would reject a forbidden move with 422. The
-     bulk job would filter on the same table in its `UPDATE … WHERE` and report those deals as
-     skipped.
-3. **Stage and status are independent.** Moving a deal to `closed_won` does not set
-   `status = won`. That would be downstream automation, which the brief rules out. The seed keeps
-   stage and status consistent anyway.
-4. **Money is integer cents** (`value_cents bigint`) in a single currency. The API caps it at
-   10^15, well inside 2^53.
-5. **Owners are opaque UUIDs.** There is no users table.
-6. **Deals are never deleted.** Nothing in scope removes one.
-7. **Tenancy comes from the `X-Workspace-Id` header**, with no auth, as the brief allows.
-
-## Bulk stage move
-
-A user picks a filter (stage, owner, status, value range, date range) and a target stage, and
-moves up to 50,000 matching deals in one action. The API answers at once with a job id, a
-background worker does the moving, and the user polls for progress.
-
-### Which deals: the snapshot, not the live set
-
-When the user clicks, the filter matches a set of deals. The job then takes a while, and meanwhile
-people keep editing: some deals start matching the filter, others stop. The job works on the
-**snapshot**: the deals that matched at the moment of the click, frozen into a list.
-
-The alternative, the **live set**, re-evaluates the filter as the job goes. That makes the job
-non-deterministic:
-
-- It walks the deals in id order. A deal that starts matching mid-job is moved only if its id
-  happens to be ahead of the job's position, so two identical runs can produce different results.
-- The total keeps changing, so progress can't honestly be shown as "x of N", and the 50,000 cap
-  stops meaning anything.
-
-The snapshot gives:
-
-- exactly the deals the user was shown ("12,345 deals will be moved"), no more and no fewer
-- a fixed total, so progress is honest and the cap is checked once, at submission
-- an auditable result: every deal on the list ends with a recorded outcome
-- a simple resume after a crash: a list, plus a position in it
-
-The consequences, accepted:
-
-- A deal that starts matching after the click is not moved. Running the same move again picks it
-  up. That is safe, because deals already in the target stage are not selected.
-- The list has to be stored: about 50,000 small rows per job.
-
-### Collisions: the person always wins
-
-While the job runs, people keep moving deals by hand, including deals on the job's list.
-Permissions (RBAC) would make this rarer but not impossible: the deal's owner and the manager
-running the job are both allowed to move it. RBAC decides _who may_ edit a deal, not _what
-happens_ when two permitted people edit it at the same time. (Auth is out of scope here anyway.)
-
-An example:
-
-- **10:00** A manager starts "move Alice's `negotiation` deals → `contract_sent`". Deal X is on
-  the list.
-- **10:01** The customer signs, and Alice marks deal X `closed_won`.
-- **10:02** The job reaches deal X.
-
-| Option                                    | Deal X ends up                                  | Why not                                                                                                                                                                                                   |
-| ----------------------------------------- | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The job overwrites                        | `contract_sent`: Alice's win is silently undone | A lost update. A decision made on 10:00 information erases a 10:01 decision, and nobody is told.                                                                                                          |
-| Block manual edits until the job finishes | Alice's 10:01 move is rejected                  | It defeats the purpose: if people must wait anyway, the job might as well be a loop. It also means errors for the whole run, locks left behind if a worker dies, and an extra check on every manual move. |
-| **The person wins** (chosen)              | `closed_won`; the job skips X and reports it    |                                                                                                                                                                                                           |
-
-How it works:
-
-- When the list is taken, each deal's `version` is recorded with it.
-- The job moves a deal only if its `version` is still the same. The check happens inside the same
-  `UPDATE` that moves the deal (a compare-and-set), so nothing can slip in between checking and
-  writing.
-- If a person moved the deal after the click, its version has changed. The job skips it and
-  records it as skipped because of a newer manual change. The user sees those deals in the job's
-  result, and can run the move again if they still want them moved.
-- If the job moves a deal first and a person moves it afterwards, the person's move simply applies
-  on top. In either order, the deal ends where the person put it.
-- Manual moves are never rejected because a job is running.
-- A same-stage click doesn't bump the version (see "Single move" below), so it can't make the job
-  skip a deal for no reason.
-
-### Idempotency: one request, one job
-
-A bulk move changes more than stages. Each move writes a history row, bumps the deal's version and
-adds to the job's counters. A duplicate therefore leaves double history, wrong counts and twice the
-database load. Worse, a retry usually arrives _later_, after people have changed things, so it
-re-applies an old intent on top of newer decisions.
-
-The version check can't catch that on its own. A duplicate job takes a fresh snapshot, which
-already includes the changes people made in between, so its version checks pass. Take the Alice
-example again: the manager's request at 10:00 loses its response, Alice wins deal X at 10:03, and
-the client retries at 10:05. Without dedupe, the retry's new job moves X back. Only recognising
-the request stops that.
-
-- The client sends an `Idempotency-Key` header: a UUID created when the user clicks, and reused by
-  every retry of that click. A request without one is rejected with 400, because without it a
-  retry can't be told apart from a deliberate second move.
-- The key is stored on the job row, under `UNIQUE (workspace_id, idempotency_key)`, in the same
-  transaction that creates the job and its snapshot. The job and its key exist together or not at
-  all, and the key survives restarts because it is a committed Postgres row.
-- **Seen key, same request** (compared by a hash of the filter and target stage): the existing job
-  is returned and nothing new is created.
-- **Seen key, different request:** rejected with 422. That is a client bug, and the server won't
-  guess which request was meant.
-- **Two copies at the same instant:** the unique constraint lets one insert win. The other waits
-  for it, then returns the winning job.
-
-Where a retry can still slip through:
-
-- A client that makes a new key for every retry. Each retry then looks like a new click.
-- Two genuine clicks have two keys and run as two jobs. That is by design: the second click is a
-  newer decision.
-
-The other half of idempotency, applying each batch exactly once even when a worker crashes or two
-workers collide, belongs to the batch mechanics described with the worker.
-
-### The job queue is a Postgres table, not Redis or BullMQ
-
-The `bulk_jobs` table _is_ the queue:
-
-- Workers claim a job with `FOR UPDATE SKIP LOCKED`, so two workers asking at once never get the
-  same job.
-- A claim is a lease, renewed after every batch. If a worker dies, its lease expires and another
-  worker takes the job over. A lease epoch that rises on every takeover fences off a stalled
-  worker that wakes up late: its writes are rejected.
-- Each batch moves its deals and saves the job's position and counters in one transaction.
-
-Why not BullMQ on Redis:
-
-1. **It doesn't give us resume.** BullMQ sees a 50,000-deal job as one unit. If the worker dies
-   at 30,000, the job is redelivered whole and starts again from zero. Resuming mid-job needs a
-   checkpoint committed _together with_ the deal updates, which only a Postgres transaction can
-   do. A checkpoint kept in Redis either repeats a batch or skips it, depending on which of the two
-   writes a crash interrupts.
-2. **Creating a job would be two writes to two stores**: the snapshot and key in Postgres, and the
-   message in Redis. A crash between them leaves a job that never runs, or a message with no
-   snapshot behind it.
-3. **It can deliver a job twice anyway.** A worker frozen past its lock (a long garbage-collection
-   pause, say) has its job handed to another worker. The duplicate protection has to live in
-   Postgres regardless.
-4. **Dedupe and progress would be only as durable as Redis's configuration.** Redis can lose its
-   most recent writes in a crash, and BullMQ needs key eviction disabled. In Postgres they are
-   committed rows.
-5. **Per-tenant limits aren't built in.** Open-source BullMQ limits concurrency per worker or per
-   queue. "One running job per workspace" needs BullMQ Pro's groups, a queue per workspace, or
-   custom locks. In Postgres it is one partial unique index.
-6. **It is one more service** to run, size, persist and monitor, and the brief asks for every
-   addition to be justified.
-
-What we give up:
-
-- Millisecond dispatch. That doesn't matter for jobs that run for tens of seconds; workers poll
-  once a second.
-- Built-in retries, replaced by an `attempts` column and lease expiry.
-- A ready-made dashboard, replaced by the progress endpoint, which reads the true state.
-
-A Redis queue is the right tool for large numbers of small, independent tasks that are safe to
-retry on their own and don't commit together with database rows, such as emails and webhooks.
-Bulk stage moves are the opposite: few, heavy jobs whose progress is database data. At larger
-scale the queue isn't what breaks first. If dispatching ever did become a bottleneck, a broker
-could carry the "work on job X" signal while the job's state stays in Postgres.
-
-### Progress: slow, stuck or failed
-
-The brief asks for progress that reports real committed state, and that lets the user tell slow,
-stuck and failed apart.
-
-**Committed state, not counters in memory.** `GET /bulk-moves/:id/progress` reads one row: the
-cursor and counters the worker commits in the same transaction as each batch. After any restart
-they are exactly right, because there is nothing in memory to lose.
-
-**Health is derived on the server** from columns already on the row: status, the lease owner and
-its expiry, the time of the last progress, attempts and the last error. Every client gets the
-same answer, and no new state is stored.
-
-| Health                | Rule                                                                                                                                          |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `queued`              | Pending, or handed back (no lease owner, lease lapsed). The detail gives the reason: this workspace's other job, or waiting for a free worker |
-| `active`              | A worker holds the lease, and a batch committed less than 2s ago                                                                              |
-| `slow`                | A worker holds the lease, but no batch has committed for 2s or more. A batch normally commits every ~50ms                                     |
-| `retrying`            | No owner, the lease still in the future, and an error recorded: the job is waiting out its backoff                                            |
-| `stalled`             | An owner whose lease has expired: that worker died or froze, and another will take over                                                       |
-| `stuck`               | Queued or stalled for more than two lease lengths (30s) while no worker holds any lease anywhere                                              |
-| `failed`, `completed` | Final                                                                                                                                         |
-
-- **It uses Postgres's clock, not the API's.** Durations are computed in SQL against `now()`, the
-  same clock that wrote the timestamps, so a skewed API clock can't make a healthy job look
-  stalled.
-- **Rate and ETA are averages since the job started**, waits included. A finished job's rate is
-  measured up to `finished_at`, so it doesn't keep falling afterwards.
-
-**What polling costs, and the poll limit.** A poll is one primary-key read of a small table. It
-takes no locks and can't block the worker, because Postgres readers never wait for writers. The
-risk is a client polling in a tight loop: one API process serves every workspace. So a job's
-state can be read once every 2 seconds, whoever asks. A faster poll costs an in-memory check and
-gets 429 with `Retry-After`, and responses carry `pollAfterMs`.
-
-- **Why per job, and not per workspace or one global budget.** A single global budget would let
-  one noisy client block everyone, and per-workspace quotas weren't needed.
-- **The key is workspace plus job**, so a request naming the wrong workspace can't use up the
-  owner's allowance.
-- **The limit is shared by `/bulk-moves/:id` and `/progress`**, so alternating between them
-  doesn't get around it.
-
-Trade-offs:
-
-- The limit lives in each API instance. With several instances, each enforces its own interval; a
-  shared store or the gateway would make it exact.
-- It protects job polling only. General API rate limiting belongs at the gateway.
-- Server-sent events would remove polling altogether, but they are more machinery than the brief
-  warrants.
-
-### Isolation: polite to everything else
-
-The brief: a bulk move must not starve interactive requests in its own workspace, and must not
-affect other workspaces at all. Every workspace shares one Postgres, so the real question is how
-much of that database one job may take.
-
-**Why the rate matters, even though a move is "just one column".** The application does almost
-nothing per deal, but Postgres does a lot:
-
-- It writes a new version of the deal row, since it never updates a row in place.
-- It adds new entries to every index on `opportunities`. `stage` is indexed, so the update can't
-  take Postgres's cheap in-place (HOT) path.
-- It inserts a history row, with its own index entries.
-- It updates the item's outcome.
-- It writes all of the above to the write-ahead log and flushes it at commit.
-- Later, autovacuum has to clean up the dead row versions.
-
-Unpaced, a job moved about 47,000 deals/s, which is well over 200,000 physical writes a second.
-
-**What I measured.** The setup:
-
-- An open-loop load generator at 200 requests/s per workspace.
-- A traffic mix of 60% listing a stage, 20% reading a deal and 20% moving a deal by hand.
-- Rounds that alternate which condition runs first.
-
-The numbers below are from the reference run in BENCHMARKS.md:
-
-|                                      | Unpaced job                   | Paced at 10,000 deals/s      |
-| ------------------------------------ | ----------------------------- | ---------------------------- |
-| A 50k move: worker time / wall-clock | 1.1s / 2.1s (~47,000 deals/s) | 5.3s / 6.3s (~9,400 deals/s) |
-| Users' p99 with no job (baseline)    | 4.1–4.6ms                     | 4.2–4.3ms                    |
-| Users' p99 during jobs               | 6.3–9.0ms, about double       | 3.7–4.5ms, unchanged         |
-| Users' p99 just after jobs           | 6.3–7.0ms                     | 4.1–4.4ms                    |
-| Worst single request during jobs     | 63–83ms                       | 13–36ms                      |
-
-Both workspaces moved together: Small Co, which had no job running, suffered as much as Large
-Co. At 100 requests/s per workspace there was no measurable effect at all. The damage appears only
-once the database has less headroom, and it's in the tail (p99 and the worst requests), not the
-median. Runs vary: earlier exploratory runs showed unpaced p99 as high as 21ms during jobs and
-45ms after, with paced jobs staying under 10ms.
-
-**The mechanisms, and what each one costs:**
-
-| Mechanism                                              | What it protects                                                                                             | Trade-off                                                                                           |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| 50,000-deal cap per job                                | Bounds one job's size                                                                                        | Doesn't bound its intensity. A broader filter is rejected rather than split automatically           |
-| A separate pool for the worker (2 connections)         | Users never wait for a free connection                                                                       | Isolates connections only. CPU, disk, the write-ahead log, the cache and row locks are still shared |
-| One running job per workspace (a partial unique index) | One tenant never holds more than one worker. With one multi-row writer per workspace, deadlocks can't happen | A tenant's jobs run one after another, with no parallelism inside a tenant                          |
-| Pacing at 10,000 deals/s per job                       | Spreads writes out: users' p99 stays at its no-job level, where unpaced jobs roughly doubled it              | A 50k job takes about 5s of worker time instead of 1s                                               |
-| Batches of 500, and a 2s lock timeout                  | A user editing a deal in a batch waits milliseconds. A job blocked by a user's lock gives way and retries    | More transactions than larger batches would need                                                    |
-
-**Concurrency versus rate.**
-
-- Limiting how many jobs run at once barely helps on its own: a single unpaced job saturated the
-  database's write path by itself.
-- The rate is the lever that matters.
-- Concurrency (one job per workspace, a fixed number of workers) only bounds the total, to at most
-  workers × 10,000 deals/s.
-
-**Why 10,000 deals/s.** I measured the two ends first:
-
-- Full speed hurt users' tail latency in every workspace.
-- At 10,000/s, p99 during a job stayed at its no-job level, and a 50k job still finishes in about
-  five seconds.
-
-A lower limit would cut the impact further, at the cost of slower jobs. The limit is one
-environment variable, `WORKER_MAX_DEALS_PER_SECOND`.
-
-**Considered and not built:**
-
-- **Adaptive slow-down.** Back off when the database gets slower, whoever's load is causing it.
-  Jobs would then run faster when the database is quiet and slower when it's busy, instead of at a
-  fixed rate. Today's limit is a timer, not a measurement: a 500-deal batch is allowed one 50ms
-  window, and the worker sleeps whatever the batch didn't use. The adaptive version would work like
-  TCP congestion control:
-  1. Measure each batch's duration, smoothed over the last few batches.
-  2. Halve the current speed when a batch runs slower than a target (say 50ms against a normal
-     15ms), down to a floor.
-  3. Raise it a little after every healthy batch, up to the 10,000/s ceiling.
-
-  The current speed would be saved on the job row inside the checkpoint that already runs for
-  every batch, so it costs no extra query. A resumed or handed-back job would then keep the speed
-  it had learned, and the progress endpoint could report "throttled to 3,000/s because the database
-  is busy". Its limits: batch time is a noisy proxy for users' latency, and checkpoint and vacuum
-  spikes arrive after the writes that cause them, so it would shorten them rather than prevent
-  them. A fixed limit is simpler to reason about and to measure, so adaptive pacing is on the "next
-  week" list.
-
-- **A global rate limit across all workers.** An exact total budget would need coordination
-  between workers, such as a shared token bucket. The number of workers bounds the total instead.
-
-**The hole it still leaves.**
-
-- Every workspace still shares one database. Pacing reduces how much of it a job takes, but it
-  can't bring the effect on other workspaces to zero.
-- Even paced, single requests occasionally took 13–36ms during jobs and up to 91ms just after
-  them. That comes from database-wide work such as checkpoints and vacuum, which no per-job limit
-  controls.
-- N workers running N tenants' jobs add up.
-
-Real isolation needs separate databases: shard workspaces across clusters, with the largest
-tenants on shards of their own (see Scaling).
-
-### Fairness between workspaces
-
-Pacing decides how hard a job hits the database. Fairness decides which tenant gets a worker next.
-
-- **Already fair:** one running job per workspace means a tenant never holds more than one
-  worker. With several workers, several tenants always progress side by side.
-- **The gap:** when every worker was busy, the next job was simply the oldest one. Take one
-  worker, where A queues ten jobs and then B queues one. B waited behind A's entire backlog,
-  because A's queued jobs are always older.
-
-Two mechanisms close the gap, and they only work together:
-
-1. **Round-robin turns.** `bulk_workspace_turns` records when each workspace last got a worker. A
-   free worker takes the next job from the workspace whose turn came longest ago (never served
-   goes first), oldest job first within that workspace. The turn is recorded in the same
-   statement as the claim. One worker now runs A1, B1, A2, … instead of A1, A2, … A10, B1.
-2. **Time slicing.** After `WORKER_SLICE_MS` (5s), if another workspace's job is waiting, a worker
-   hands its job back. The job resumes later from its cursor, and the hand-back doesn't count as a
-   failure. A job running alone is never interrupted.
-
-Why both are needed:
-
-- **Without round-robin, slicing achieves nothing.** The handed-back job is still the oldest, so
-  it is claimed straight back. Removing round-robin made the slicing test fail too.
-- **Without slicing, round-robin acts only when a job ends**, so one long job still holds its
-  worker.
-
-A live check, with one worker and a 1s slice:
-
-1. A Large Co job of 50,000 deals was handed back at 9,500.
-2. A 179-deal Small Co job ran within about a second, instead of waiting the ~5 seconds the
-   Large Co job needed.
-3. Large Co then resumed and finished, with every deal moved once.
-
-Trade-offs:
-
-- **Slice length.** A shorter slice is fairer, but means more hand-backs and claims. At 5s the
-  overhead is negligible, and no tenant waits behind any one job for more than one slice plus a
-  batch.
-- **Turns are counted, not timed.** Each claim is one turn, however long it runs. A workspace
-  whose turns are 5-second slices and one whose jobs finish in 0.1s get the same number of turns,
-  not the same worker time. The slice caps the imbalance per round. Weighted fair queuing would
-  account for time used, which isn't worth its complexity at this scale.
-- **A handed-back job may continue on another worker.** That's harmless: every batch is fenced by
-  the lease epoch and resumes from the committed cursor.
-
-### Scaling
-
-One rule decides the architecture at every size: a job's progress must be committed together
-with the deal updates it describes, so the job lives in the same database as the deals. Whatever
-hands out the work, the work itself is writes to that database. So scaling means making each move
-cheaper, then adding databases. The queue design doesn't change.
-
-"1 billion stage changes" is not one job; jobs stay at 50,000 deals (500,000 in the 10× case). It
-is the total across all tenants, and the period decides everything:
-
-| 1B changes per | Average rate                    | One Postgres server? |
-| -------------- | ------------------------------- | -------------------- |
-| year           | ~32/s                           | Easily               |
-| month          | ~385/s                          | Yes, if well sized   |
-| day            | ~11,600/s, with peaks ~35–60k/s | No                   |
-
-The order to scale in, cheapest first:
-
-1. **Measure** the per-server ceiling (BENCHMARKS.md).
-2. **Make each move cheaper.** Use larger batches written in one statement, and keep the fewest
-   indexes possible on `opportunities`, since a stage change rewrites every one of them. Tune
-   autovacuum for the busy tables.
-3. **Use a bigger server.**
-4. **Partition** `stage_transitions` by month and `bulk_job_items` by day. Old partitions are
-   dropped or archived instead of being deleted row by row.
-5. **Add read replicas** for read traffic, and use change-data-capture for downstream systems
-   (see below).
-6. **Shard by workspace**, putting the largest tenants on shards of their own.
-7. **Possibly move to distributed SQL** (CockroachDB, YugabyteDB, Spanner). It shards
-   automatically, at the price of slower writes and new trade-offs.
-
-**Sharding by workspace:**
-
-- A directory maps each workspace to a shard. Every shard has the full schema, including its own
-  `bulk_jobs` and `bulk_job_items` tables, and its own pool of workers.
-- A bulk move never leaves its workspace, and a workspace never spans shards. So creating a job,
-  running each batch and reading progress are all single-shard transactions. Idempotency keys,
-  batch checkpoints, the version check and "one running job per workspace" keep working unchanged,
-  with no distributed transactions.
-- The code change is small: the API picks a connection pool by workspace, and each worker is
-  started for one shard.
-- Isolation improves: a large tenant's jobs load only its own shard.
-- To move a workspace to another shard:
-  1. Stop new jobs for it.
-  2. Pause its running jobs at a batch boundary.
-  3. Copy its data with logical replication.
-  4. Switch the directory entry.
-  5. Resume the jobs on the new shard. A paused job's cursor is just a row, so it travels with the
-     workspace.
-- Sharding has limits. It can't make one tenant faster than its shard allows. A single job far
-  beyond the cap (say, 100M deals) would need a different approach: splitting one job across
-  workers, or an offline migration.
-
-**Kafka stays out of the write path.** Downstream systems such as analytics, automation and search
-should learn about stage changes through change-data-capture:
-
-- A tool such as Debezium reads committed rows from Postgres's write-ahead log and publishes them
-  to Kafka. `stage_transitions` already has one row per move.
-- Only committed changes get published.
-- Nothing is lost when the reader restarts: it resumes from its position in the log.
-- The CRM's requests never wait on Kafka.
-- At scale, it also takes polling load off the database.
-
-The alternative, having the app write to both Postgres and Kafka, loses or invents events whenever
-a crash falls between the two writes. All of this is out of scope here, since the brief rules out
-downstream consumers.
-
-The brief's own 10× case (a 500,000-deal move in a workspace of 20M deals, and what fails first)
-will be answered with measurements once the job is built.
-
-## CRM foundation
-
-### Tenancy
-
-- Every query carries `workspace_id`.
-- Another tenant's deal returns 404 rather than 403, so its existence doesn't leak.
-- The guard validates the header's format but does not look the workspace up:
-  - For reads, filtering by `workspace_id` simply returns nothing for an unknown workspace.
-  - For creates, the foreign key rejects it, and the API maps that to 404.
-  - This keeps a round trip off every interactive request, which matters once we measure their
-    p99 latency during a bulk job.
-
-### Single move
-
-The move is one short transaction:
-
-1. `SELECT … FOR UPDATE` locks the row.
-2. Check the preconditions.
-3. `UPDATE … version = version + 1`.
-4. Insert the transition.
-
-The details:
-
-- **The row lock serialises concurrent movers**, so each transition records the stage the deal
-  really left. Without it, two movers can both read stage A and both log `A → x`. The concurrency
-  test fails in 5 of 5 runs when `FOR UPDATE` is removed.
-- **`version` is the optimistic-concurrency token.**
-  - A client may send `expectedVersion`. A mismatch returns 409 with the current state, and nothing
-    is written.
-  - The version check runs before the no-op check, so a client with stale data is told so even if
-    the deal happens to be where it wanted.
-- **A same-stage move writes nothing**: no transition and no version bump. The bulk job will
-  compare-and-set on `version`, so a bump without a change would make it skip that deal for no
-  reason.
-- **Timestamps use `clock_timestamp()`.** `now()` returns the transaction's start time. For a mover
-  that queued on the row lock, that can be earlier than the write it waited behind, so ordering
-  history by time could contradict ordering it by id.
-
-### Pagination
-
-- Keyset pagination on `(workspace_id, stage, id)`: `id > cursor ORDER BY id LIMIT n + 1`.
-- Cost doesn't grow with depth: pages at `id > 250000` in the 500k workspace run in under 0.1ms.
-- Deals entering or leaving the stage between requests don't shift later pages, as they would with
-  `OFFSET`.
-- The extra row tells us whether another page exists, without a `COUNT`.
-- A deal's history (`GET /opportunities/:id/transitions`) uses the same contract on
-  `stage_transitions(opportunity_id, id)`. It is ordered by `id` rather than by time because id
-  order is the order the row lock granted the moves. A deal outside the caller's workspace returns
-  404, not an empty history.
-- There is deliberately no workspace-wide history feed. It would need another index on a table
-  the bulk job writes 50,000 rows to per run.
-
-### Indexes, and why there are so few
-
-Besides the primary keys there is only `opportunities(workspace_id, stage, id)`.
-
-- Because `stage` is indexed, a stage change can never be a HOT update (an update Postgres can
-  apply in place without touching indexes).
-- So every index on the table gets a new entry on every move, and the bulk job pays for each extra
-  index 50,000 times per run.
-- The indexes the bulk filter needs (owner, dates) will be added with the bulk engine, and
-  measured.
-
-### Migrations
-
-- Migrations are plain SQL files applied in filename order.
-- Each file runs in one transaction together with its bookkeeping row.
-- An advisory lock serialises migrators across processes, because compose can start several at
+1. One 12-stage pipeline for every workspace, where the brief gives each its own. The bulk engine
+   only writes a stage value, so per-workspace pipelines wouldn't change it.
+2. No rules on the transition sequence: any stage may move to any other. A move to the current
+   stage is a no-op.
+3. Stage and status are independent: moving to `closed_won` doesn't set `status = won`.
+4. Money is integer cents, in one currency.
+5. Owners are opaque UUIDs.
+6. Deals are never deleted.
+7. The workspace comes from the `X-Workspace-Id` header, with no auth.
+8. The filter's date range is the deal's creation date.
+9. A filter matching more than 50,000 deals is refused with 422, not split into several jobs.
+
+## 1. Chunking, the cursor and the index
+
+The transaction that creates the job also copies every matching deal into `bulk_job_items`,
+numbered `seq` 1…N in id order, with each deal's `version` and stage at that moment. The worker
+walks this list in batches of 500, one transaction each:
+
+1. **Fence:** lock the job row and check the lease epoch is still this worker's.
+2. **Apply,** in one statement: move each deal whose version still matches, write its history row,
+   and set every item's outcome to `moved` or `skipped_conflict`.
+3. **Checkpoint:** advance `cursor_seq` and the counters, renew the lease, and commit.
+
+**The cursor survives a restart** because it commits together with the moves it counts. A crash
+before the commit undoes the whole batch, which is simply redone; after it, the batch is final. A
+CHECK constraint (moved + skipped = cursor) makes Postgres refuse an inconsistent checkpoint.
+
+**The index** is the list's primary key, `(job_id, seq)`. Each batch is a range read of exactly the
+next 500 entries, so the last batch costs what the first did: no OFFSET, and the filter is never
+re-run. The statement is written so the planner can't turn a batch into a scan of the whole list,
+which once made batches take 2.6s instead of 16ms ([docs/challenges.md](docs/challenges.md)).
+
+Batch size and speed are separate settings. 500 deals per transaction keeps row locks to about 10ms
+and caps what a crash can undo; the pace of 10,000 deals/s gives each batch a 50ms slot (section 5).
+
+**Retries.** A failed batch rolls back and is retried whole, and later batches wait, because the
+cursor hasn't moved. The worker records the failure and releases the job for a backoff of 2s,
+doubling up to 60s. After five failures the job is `failed`, and deals already moved stay moved.
+
+**Lost workers.** A claim is a 15s lease, renewed by every batch, and it raises the lease epoch.
+
+- A worker that dies stops renewing. Postgres rolls back its open batch, and once the lease lapses
+  another worker resumes from the cursor.
+- A worker that freezes mid-batch keeps the job row locked, so nobody can claim the job, until
+  Postgres ends its idle session after 15s and rolls the batch back.
+- A frozen worker that wakes after a takeover fails its next fence check, and its other writes
+  check the epoch too, so it changes nothing.
+- A planned stop (a deploy, or a used-up time slice) finishes its batch and releases the lease at
   once.
-- Stages are written out in the migration instead of being generated from code. A migration is a
-  snapshot and must not change when the code does; the drift test keeps them linked.
 
-### Seed data
+**What "correct" means after a kill.** When the job completes:
 
-- There is one `INSERT … SELECT generate_series` per workspace.
-- All random draws happen in a single CTE, with a fixed `setseed()` per workspace and a fixed time
-  anchor (2026-10-01).
-- Two runs produce byte-identical tables (checked with an md5 over the ordered rows), so benchmark
-  numbers can be reproduced exactly.
-- The full seed takes about 5s for 500k rows.
+- every deal on the list has exactly one outcome
+- every moved deal was moved once, with one history row from this job, which a unique index on
+  `(bulk_job_id, opportunity_id)` enforces
+- no deal outside the list was touched
+- deals people changed meanwhile are where they left them
+
+It doesn't mean "identical to an uninterrupted run": people kept working during the delay, and the
+job respects their edits. The kill benchmark checks all four after a SIGKILL at 31,500 of 50,000.
+
+**What a half-applied job looks like.** Progress reads `31,500 / 50,000`, and health goes from
+`slow` (no batch for 2s, lease still valid) to `stalled` (lease lapsed) to `active` after the
+takeover, about 15s later. Each deal is either fully moved (stage, version, history, outcome) or
+untouched, and `GET /bulk-moves/:id/items` shows which. A failed job stays visibly partial, and
+running the move again finishes it, since deals already in the target stage are left out.
+
+## 2. Idempotency
+
+- **The key** is the `Idempotency-Key` header: a UUID the client creates once per user action, not
+  per click, and resends with every retry of it. It's required (400 without it), because otherwise
+  a retry can't be told apart from a second move.
+- **It's stored** on the job row under `UNIQUE (workspace_id, idempotency_key)`, with a hash of the
+  normalised request, in the transaction that creates the job and its list. It survives restarts
+  because it's a committed row.
+- **It protects** against the retry after a lost response, which the client can't resolve on its
+  own:
+  - same key and request: the original job comes back (202, `Idempotent-Replayed: true`) and no new
+    list is taken
+  - same key, different request: 422
+  - two copies at once: the unique index makes the second wait, then return the first's job
+
+  A duplicate isn't harmless: it would take a fresh list that already includes people's later
+  edits, pass its version checks, and re-apply an old decision over newer ones.
+
+- **Inside the job,** each batch applies once even when workers crash or overlap: the checkpoint
+  commits with the batch, the epoch fences replaced workers, and history allows one move per deal
+  per job.
+- **A retry still slips through** when a client makes a new key for each retry. That duplicate
+  moves nothing the first job moved, but it does move deals people changed between the two
+  requests.
+
+## 3. Concurrency on a single deal
+
+A **manual move** is one short transaction: `SELECT … FOR UPDATE`, an `UPDATE` that bumps
+`version`, and the transition row. The row lock serialises movers, so each transition records the
+stage the deal really left; the concurrency test fails without it. A stale `expectedVersion` gets
+409 and the current state. A same-stage move writes nothing, so it can't make a job skip the deal.
+
+The **job** takes no lock up front. Its `UPDATE` is a compare-and-set: a deal moves only if its
+version still equals the one in the list. When a person and the job hit the same deal, **the person
+wins**:
+
+- **Person first:** the version has changed, so the job skips the deal and reports it as
+  `skipped_conflict`.
+- **Job first:** the person's move applies on top, or gets 409 if they sent the old version.
+- **Same instant:** if the batch waits on the person's row lock, Postgres re-checks the version once
+  the person commits, and the job skips the deal. If the person waits on the batch, it's for
+  milliseconds. A test forces this race by waiting until `pg_locks` shows the batch blocked.
+- A batch waits at most 2s for a lock, then is retried later.
+
+Overwriting would silently undo a newer human decision with one made on older information. Blocking
+manual edits during a job would defeat the point of running it in the background. So manual moves
+are never refused because a job is running, and skipped deals are listed so the user can rerun the
+move.
+
+## 4. Snapshot vs live
+
+The job works on the **snapshot**: the deals that matched at the click. A **live** set would
+re-check the filter as the job goes, and that is non-deterministic. The job walks deals in id
+order, so a deal that starts matching mid-run is moved only if its id is still ahead of the cursor.
+The total keeps changing too, so progress can't say "x of N" and the cap stops meaning anything.
+The snapshot moves exactly what the user was shown, with a fixed total, an outcome for every deal,
+and a resume that is just a list and a position.
+
+The consequences:
+
+- **Deals that join the set after the click aren't moved,** new deals included. Rerunning the move
+  picks them up safely, since deals already in the target stage are left out.
+- **Deals that leave the set aren't moved either:** any change bumps the version, so the job skips
+  them.
+- **The list is stored:** about 9 MB per 50,000-deal job, kept forever today (section 6).
+
+## 5. Isolation, and the hole
+
+Every workspace shares one Postgres, so isolation means limiting how much of it a job takes. To the
+application a move is one column; to Postgres it's a new row version, a new entry in every index on
+`opportunities`, a history row, an item update and the log writes for all of them. Unpaced, one job
+moved about 47,000 deals/s and doubled every workspace's p99.
+
+| Mechanism                                              | What it does                                                                                                                         |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Pacing at 10,000 deals/s per job                       | Each 500-deal batch gets a 50ms slot. The main lever                                                                                 |
+| One running job per workspace (a partial unique index) | A tenant holds at most one worker, so the pace is also a per-workspace limit                                                         |
+| Round-robin turns and 5s time slices                   | A free worker serves the workspace served longest ago, and a long job hands its worker back after 5s if another workspace is waiting |
+| A separate 2-connection pool for the worker            | Users never wait for a database connection                                                                                           |
+| 500-deal batches and a 2s lock timeout                 | A person waits milliseconds behind a batch; a batch blocked by a person gives way                                                    |
+
+**Measured** at 200 requests/s per workspace: with paced jobs running, p99 was 4.5ms in the job's
+workspace and 4.3ms in another, against 4.1–4.6ms with no job. Unpaced, it was 7.1 and 9.0ms.
+
+**The hole** is that the database is still shared:
+
+- Checkpoints, vacuum and log flushes are database-wide, and no per-job limit controls them. Even
+  paced, single requests reached 36ms during jobs and 91ms just after.
+- The limit is per job, so N workers running N tenants' jobs add up.
+- The pace is fixed: it doesn't back off when the database is busy for other reasons.
+
+Real isolation needs separate databases, with the largest tenants on shards of their own. Adaptive
+pacing would narrow the hole on one database.
+
+## 6. What breaks at 10×
+
+That is a 500,000-deal move in a workspace of 20M deals. The job's own mechanics hold: a batch
+still reads 500 entries through `(job_id, seq)`, a resume loses at most one batch, and progress and
+idempotency touch one row. What gives way is the work around them. Measured on the 500k seed and
+extrapolated, not yet measured at 20M:
+
+|                                | Measured                       | At 10×                                              |
+| ------------------------------ | ------------------------------ | --------------------------------------------------- |
+| Deals table, with indexes      | 263 bytes per deal             | 20M deals ≈ 5.3 GB, against a 160 MB Postgres cache |
+| The list and its history       | 189 + 180 bytes per deal moved | ≈ 185 MB per job, never deleted                     |
+| Write-ahead log                | 1,234 bytes per deal moved     | ≈ 600 MB per job, with a checkpoint every ~1 GB     |
+| Submission, including the list | 0.16–0.2s for 50,000 deals     | ≈ 2s just to write 500,000 items                    |
+| A narrow filter with no index  | ≈ 30ms across 500k deals       | ≈ 1s across 20M in memory, more from disk           |
+
+**The first thing to fail is submission.** The list is built inside the POST, in one statement,
+under the API's 5s statement timeout, on one of its 10 connections. At 10× that statement scans up
+to 20M deals and writes 500,000 rows: about 3–5s in memory, more once the table no longer fits. The
+request times out and no job is created. It's the only step whose cost grows with the job while it
+runs under a hard limit, and even before it fails, a few large submissions at once would tie up the
+pool that interactive requests use.
+
+**The fix:** build the list in the worker. The API saves the job as `preparing` and returns at
+once; the worker fills the list in chunks of about 10,000 ids, with no request timeout, and
+progress reports it. The list then takes seconds to build rather than an instant, which the
+version check makes safe. Then measure whether an index on owner is worth the extra write it adds
+to every move.
+
+**What degrades next:**
+
+1. **The fixed pace.** Once the table no longer fits in memory, every batch reads from disk and
+   10,000 deals/s costs everyone more. → Adaptive pacing.
+2. **Checkpoints.** About one forced checkpoint per job, so more latency spikes in every workspace.
+   → A larger `max_wal_size`.
+3. **Vacuum.** Each job leaves 500,000 dead row versions. At the default 20% threshold, autovacuum
+   makes one long pass over 5 GB every eight jobs. → Per-table autovacuum at about 1%, in small
+   passes.
+4. **Growth.** About 185 MB of list and history per job, forever. → Delete a finished job's `moved`
+   items, since history records them, and partition history by month.
+5. **Queueing.** A job now takes about 50s, and a workspace runs one at a time.
+
+## 7. Another week, ranked
+
+1. **Four small fixes found while writing this.**
+   - After the fifth failure, a job waits out one more backoff, showing "attempt 6 of 5", before
+     it's marked failed.
+   - The lease is renewed from the batch's start time, so a batch that commits more than 15s after
+     it started can be taken over needlessly. `clock_timestamp()` fixes it.
+   - A job handed back on shutdown, or after a retry wait, is described as "paused to give another
+     workspace a turn".
+   - `stuck` is judged by whether any worker holds a lease, which idle workers don't; a worker
+     heartbeat would make it exact.
+2. **Build the list in the worker** (section 6).
+3. **Cancel, then undo.** Cancelling at a batch boundary is safe thanks to the fence. Undo is a
+   reverse job built from each item's `from_stage`, with the same person-wins check.
+4. **Adaptive pacing.** Halve the rate when batches slow down, raise it gently while they're
+   healthy, and keep it in the checkpoint so it survives a takeover.
+5. **Retention.** Delete finished jobs' `moved` items, and partition history by month.
+6. **Poison batches.** A batch that always fails stops the whole job. Split it until the bad deal is
+   isolated, mark that one failed, and carry on.
+7. **Faster start and takeover.** `LISTEN/NOTIFY` removes the ~1s polling delay before a job
+   starts, and a shorter lease shortens the 15s takeover.
+8. **Measure with several workers and API processes, and at 20M deals.** Every number here comes
+   from one of each, on one machine.
